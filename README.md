@@ -19,23 +19,20 @@ it runs today.
 ## The three brain classes — and where this pack sits
 
 A cortex agent's *brain* is whatever process answers the wire protocol. The
-ecosystem taxonomy
-([meta-factory#562](https://github.com/the-metafactory/meta-factory/issues/562))
-names three classes:
+ecosystem taxonomy names three classes:
 
 | Class | What answers | Sample |
 |---|---|---|
 | **deterministic** | pure rules — no model call anywhere; every reply is written by hand and every effect is code-audited | **this pack** |
-| **LLM-hosted** | the host runs a model session as the brain (e.g. a claude-code substrate agent) | cortex's Pier |
-| **hybrid** | an exec brain that *calls* a model for language but keeps effects in code | yarrow |
+| **LLM-hosted** | the host runs a model session as the brain (e.g. a claude-code substrate agent) | [example-non-deterministic](https://github.com/the-metafactory/metafactory-cortex-agent-example-non-deterministic) |
+| **hybrid** | an exec brain that *calls* a model for language but keeps effects in code | [example-hybrid](https://github.com/the-metafactory/metafactory-cortex-agent-example-hybrid) |
 
 Deterministic is the right class for an agent that faces **anonymous
 strangers**: there is no prompt to inject into, no tool loop to widen, and the
 complete behaviour fits in one reviewable file
 ([`brain/handler.ts`](./brain/handler.ts)). The trade-off is equally plain —
 canned replies, keyword triggers, no free conversation. When you need
-language, you move to hybrid (yarrow's shape) and keep the effect discipline
-below.
+language, you move to hybrid and keep the effect discipline below.
 
 ## Terminology (cortex ubiquitous language)
 
