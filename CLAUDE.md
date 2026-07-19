@@ -35,8 +35,8 @@ When `CONTEXT.md` and your instinct disagree, `CONTEXT.md` wins. When a term cro
 
 - `agent.yaml` — the cortex fragment (installed to `agents.d/escort.yaml`; paths written for the INSTALLED location — `persona: ../personas/escort.md`).
 - `persona.md` — the doorkeeper character; its `allowedTools: []` MUST mirror `agent.yaml`'s `openOnboardingAllowedTools` exactly.
-- `brain/` — cortex-brain/v1 exec brain: `main.ts` (socket shell), `handler.ts` (all behaviour), `protocol.ts` (wire types incl. `create_private_thread`, cortex#2206, and `post_log`, cortex#2256), `state.ts` (fail-soft agent-state persistence), `config.ts` + `env.ts` (principal-overlay identity resolution).
-- `test/handler.test.ts` — 23 tests asserting the exact effect stream, including per-task `result` termination and thread-context routing; `test/state.test.ts` — 13 persistence tests (rehydration, duplicate-mention pointer, in-thread turns across restarts, fail-soft degradation).
+- `brain/` — cortex-brain/v1 exec brain: `main.ts` (socket shell), `handler.ts` (all behaviour), `protocol.ts` (wire types incl. `create_private_thread`, cortex#2206, and `post_log`, cortex#2256), `state.ts` (DB-authoritative read-through agent-state persistence, memory-only degraded mode), `config.ts` + `env.ts` (principal-overlay identity resolution).
+- `test/handler.test.ts` — 26 tests asserting the exact effect stream, including per-task `result` termination and thread-context routing; `test/state.test.ts` — 19 persistence tests (restart continuity, external writes visible without restart, duplicate-mention pointer, orphaned-pending sweep, memory-only degradation incl. a mid-run DB death).
 - `scripts/` — lifecycle postinstall (reload; state scaffold with soft-skip). Deliberately NO nats-creds script: the escort is in-process, not bus-sovereign.
 
 ## Gate

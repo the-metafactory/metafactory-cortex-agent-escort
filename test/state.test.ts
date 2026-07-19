@@ -1,5 +1,6 @@
 /**
- * Persistence tests — the escort's agent-state instance.
+ * Persistence tests — the escort's agent-state instance, DB-authoritative
+ * read-through edition.
  *
  * Fixture ids: user ids are non-numeric placeholders per this repo's rules.
  * THREAD ids are deliberately short fake numerics (9–12 digits — a real
@@ -11,9 +12,13 @@
  * ~/.config/cortex/agents/escort) with dashboard regeneration disabled
  * (`bundleDir: null`) so no subprocess is ever spawned. The security-critical
  * effect-stream assertions live in handler.test.ts and are unchanged; these
- * tests cover what state ADDS: rows written per transition, rehydration after
- * a restart, the polite duplicate-mention pointer, and the fail-soft
- * missing/corrupt-DB degradation to memory-only behaviour.
+ * tests cover what state ADDS: rows written per transition, restart
+ * continuity (per-event reads make restarts a non-event), EXTERNAL writes —
+ * a steward's resolve/reset from another connection — visible on the very
+ * next mention with no restart, the polite duplicate-mention pointer, the
+ * orphaned-pending sweep, and the inverted fail-soft: a missing, corrupt,
+ * or mid-run-dying DB degrades to a transient memory-only session store
+ * with an identical effect stream.
  */
 
 import { test, expect, afterEach } from "bun:test";
@@ -123,14 +128,21 @@ test("the full pipeline writes one onboarding work_item whose status mirrors the
   row = db.query("SELECT * FROM work_items WHERE id = 't1'").get() as Record<string, unknown>;
   // surfaced parks at waiting_human and STAYS OPEN — a human resolves it.
   expect(row.status).toBe("waiting_human");
+  // The engaged heuristic lives in notes JSON now: two conversational turns.
+  expect(JSON.parse(row.notes as string)).toEqual({ thread_id: "777888999", turns: 2 });
 
   const events = db
     .query("SELECT type FROM events WHERE work_item_id = 't1' ORDER BY id ASC")
     .all() as Array<{ type: string }>;
+  // Each conversational turn annotates the turn counter (the annotate
+  // discipline: notes merge + work_item_annotated) — same event vocabulary
+  // agent-state already ships, two more instances of it.
   expect(events.map((e) => e.type)).toEqual([
     "work_item_created",
     "work_item_claimed",
-    "work_item_annotated",
+    "work_item_annotated", // thread_id
+    "work_item_annotated", // turns: 1
+    "work_item_annotated", // turns: 2
     "work_item_parked",
   ]);
   db.close();
@@ -163,7 +175,7 @@ test("cancel and effect_rejected resolve the work_item (cancelled / failed) inst
   store.close();
 });
 
-// ── rehydration after restart ───────────────────────────────────────────────
+// ── restart continuity (per-event reads — nothing to rehydrate) ─────────────
 
 test("RESTART: a returning user's mention produces the polite pointer post referencing their thread — and NO create_private_thread", () => {
   const dir = tempInstanceDir();
@@ -175,11 +187,12 @@ test("RESTART: a returning user's mention produces the polite pointer post refer
   brainA.onEvent({ v: 1, type: "thread_created", task_id: "t-old", thread_id: "555666777888" });
   storeA.close();
 
-  // Fresh process: new store, new brain, boot hello → rehydrate.
+  // Fresh process: new store, new brain. Boot hello only sweeps orphaned
+  // pendings — the session itself is read from the DB on the next event.
   const storeB = openStore(dir);
   const { brain, effects } = recorder(storeB);
   brain.onEvent(helloEvent());
-  expect(effects.length).toBe(0); // rehydration is pure memory rebuild — no effects
+  expect(effects.length).toBe(0); // the boot sweep emits no effects, ever
 
   // The returning user mentions again — a NEW task_id (old task is dead host-side).
   brain.onEvent(taskEvent("t-new", "returning-user"));
@@ -198,7 +211,7 @@ test("RESTART: a returning user's mention produces the polite pointer post refer
   storeB.close();
 });
 
-test("RESTART: a surfaced session rehydrates too — pointer post, work_item still waiting_human", () => {
+test("RESTART: a surfaced onboarding is still authoritative after a restart — pointer post, work_item still waiting_human", () => {
   const dir = tempInstanceDir();
   const storeA = openStore(dir);
   const brainA = recorder(storeA).brain;
@@ -289,7 +302,7 @@ test("a rejected post_log leaves the work_item state identical — still waiting
   store.close();
 });
 
-test("RESTART: a rehydrated session converses in-thread — a readiness turn surfaces instead of the pointer", () => {
+test("RESTART: an open onboarding converses in-thread across a restart — a readiness turn surfaces instead of the pointer", () => {
   const dir = tempInstanceDir();
 
   // Life before the restart: thread open for user 4601.
@@ -299,7 +312,8 @@ test("RESTART: a rehydrated session converses in-thread — a readiness turn sur
   brainA.onEvent({ v: 1, type: "thread_created", task_id: "t-rc", thread_id: "121212121" });
   storeA.close();
 
-  // Fresh process: rehydrate, then the user replies IN THEIR THREAD.
+  // Fresh process: no rehydration step — the user replies IN THEIR THREAD
+  // and the routing read finds the open work_item directly in the DB.
   const storeB = openStore(dir);
   const { brain, effects } = recorder(storeB);
   brain.onEvent(helloEvent());
@@ -345,6 +359,88 @@ test("RESTART: an orphaned thread_requested item is resolved failed and the user
   storeB.close();
 });
 
+test("RESTART: the engaged heuristic survives — turns are counted in the DB, so a post-restart readiness claim still reads 'look done'", () => {
+  const dir = tempInstanceDir();
+  const storeA = openStore(dir);
+  const brainA = recorder(storeA).brain;
+  brainA.onEvent(taskEvent("t-turns", "turns-user"));
+  brainA.onEvent({ v: 1, type: "thread_created", task_id: "t-turns", thread_id: "818181818" });
+  brainA.onEvent(taskEvent("t-turns-1", "turns-user", "818181818", "a question about the intro"));
+  storeA.close();
+
+  // The old in-memory messageCount would have reset here and hedged
+  // "look not done yet" — the DB-held counter knows better.
+  const storeB = openStore(dir);
+  const { brain, effects } = recorder(storeB);
+  brain.onEvent(helloEvent());
+  brain.onEvent(taskEvent("t-turns-2", "turns-user", "818181818", "ok — done"));
+
+  expect(posts(effects).at(-1)?.text).toContain("look done");
+  expect(posts(effects).at(-1)?.text).not.toContain("look not done yet");
+  storeB.close();
+});
+
+// ── external writes: the DB is authoritative, read per event ────────────────
+// A steward's `errands.ts resolve` (or any reset) happens on a SECOND
+// connection from another process while the brain is running. Because every
+// routing decision is a fresh DB read, the change takes effect on the
+// member's very next mention — no daemon restart, no hello, no rehydration.
+
+/** What agent-state's errands CLI does: resolve + its event, external actor. */
+function externallySetStatus(dir: string, id: string, status: string): void {
+  const external = new Database(join(dir, "state.sqlite"));
+  external
+    .query(`UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?`)
+    .run(status, Date.now(), id);
+  external
+    .query(`INSERT INTO events (ts, type, actor, work_item_id, payload) VALUES (?, ?, ?, ?, ?)`)
+    .run(Date.now(), "work_item_resolved", "steward", id, JSON.stringify({ status }));
+  external.close();
+}
+
+test("EXTERNAL RESOLVE: a steward resolving a surfaced item from another connection is visible on the member's NEXT mention — fresh onboarding, no restart", () => {
+  const dir = tempInstanceDir();
+  const store = openStore(dir);
+  const { brain, effects } = recorder(store);
+
+  // Full flow to waiting_human, mid-run sanity: a duplicate mention points.
+  brain.onEvent(taskEvent("x1", "resolved-user"));
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "x1", thread_id: "606060606" });
+  brain.onEvent(taskEvent("x1-t", "resolved-user", "606060606", "all done, ready"));
+  brain.onEvent(taskEvent("x2", "resolved-user"));
+  expect(posts(effects).at(-1)?.text).toContain("<#606060606>");
+  expect(threads(effects).length).toBe(1);
+
+  // The steward says the welcome and resolves the item (errands.ts resolve).
+  externallySetStatus(dir, "x1", "done");
+
+  // NO restart, NO hello — the very next mention starts FRESH onboarding.
+  brain.onEvent(taskEvent("x3", "resolved-user"));
+  expect(threads(effects).length).toBe(2);
+  expect(threads(effects).at(-1)?.task_id).toBe("x3");
+  expect(otherEffectKinds(effects)).toEqual([]);
+  store.close();
+});
+
+test("EXTERNAL RESET: cancelling an in-flight onboarding from another connection mid-run means the next mention retries fresh — no restart", () => {
+  const dir = tempInstanceDir();
+  const store = openStore(dir);
+  const { brain, effects } = recorder(store);
+
+  brain.onEvent(taskEvent("y1", "reset-user"));
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "y1", thread_id: "616161616" });
+  // Mid-conversation, a steward resets the stuck onboarding externally.
+  externallySetStatus(dir, "y1", "cancelled");
+
+  // Channel mention → fresh onboarding immediately (no pointer to the old thread)…
+  brain.onEvent(taskEvent("y2", "reset-user"));
+  expect(threads(effects).length).toBe(2);
+  expect(threads(effects).at(-1)?.task_id).toBe("y2");
+  const pointerPosts = posts(effects).filter((p) => p.text.includes("already have a thread"));
+  expect(pointerPosts.length).toBe(0);
+  store.close();
+});
+
 // ── duplicate mention with a live (same-process) session ────────────────────
 
 test("a duplicate mention with a live session gets the polite pointer post — replacing the old silent ignore", () => {
@@ -364,6 +460,29 @@ test("a duplicate mention with a live session gets the polite pointer post — r
   expect(later?.text).toContain("<#999000111>");
   expect(threads(effects).length).toBe(1);
   expect(otherEffectKinds(effects)).toEqual([]);
+});
+
+test("a LIVE pending row (thread request in flight, same process) is never lazily swept — the duplicate mention gets the 'already opening' pointer", () => {
+  const dir = tempInstanceDir();
+  const store = openStore(dir);
+  const { brain, effects } = recorder(store);
+
+  brain.onEvent(taskEvent("p1", "live-pending-user")); // create requested, ack not yet back
+  brain.onEvent(taskEvent("p2", "live-pending-user")); // duplicate while still pending
+
+  expect(threads(effects).length).toBe(1);
+  expect(posts(effects).at(-1)?.text).toContain("already opening a thread");
+
+  // The pending row survived the read (it has a live correlation)…
+  const db = rawDb(dir);
+  const row = db.query("SELECT status FROM work_items WHERE id = 'p1'").get() as { status: string };
+  expect(row.status).toBe("pending");
+  db.close();
+
+  // …and the ack still lands normally afterwards.
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "p1", thread_id: "919191919" });
+  expect(posts(effects).at(-1)?.text).toContain("Welcome");
+  store.close();
 });
 
 // ── fail-soft: missing / corrupt DB → memory-only, identical effect stream ──
@@ -396,6 +515,34 @@ test("a corrupt state.sqlite yields null and never throws", () => {
   const dir = tempInstanceDir();
   writeFileSync(join(dir, "state.sqlite"), "this is not a sqlite database at all");
   expect(EscortStateStore.open({ dir, bundleDir: null })).toBeNull();
+});
+
+test("RUNTIME FAIL-SOFT: a DB that dies mid-run flips the brain to memory-only sessions — no throw, and the full flow keeps working", () => {
+  const dir = tempInstanceDir();
+  const store = openStore(dir);
+  const { brain, effects } = recorder(store);
+  brain.onEvent(taskEvent("r1", "outage-user-a"));
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "r1", thread_id: "717171717" });
+
+  // The DB dies under the brain (closed handle = every op now throws inside).
+  store.close();
+
+  // The next event trips the failover: logged once, degraded to the
+  // transient memory store, never a throw. DB-held sessions are gone with
+  // the DB — that is the documented degradation; restart recovers DB mode.
+  expect(() => brain.onEvent(taskEvent("r2", "outage-user-b"))).not.toThrow();
+
+  // A complete onboarding flow still works, memory-only.
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "r2", thread_id: "727272727" });
+  brain.onEvent(taskEvent("r2-t1", "outage-user-b", "727272727", "what avatar?"));
+  brain.onEvent(taskEvent("r2-t2", "outage-user-b", "727272727", "ok, all set"));
+  expect(posts(effects).at(-1)?.text).toContain("flagged this for a person");
+  expect(posts(effects).at(-1)?.text).toContain("look done"); // turns tracked in memory mode too
+  // …and the duplicate pointer works from the memory store.
+  brain.onEvent(taskEvent("r3", "outage-user-b"));
+  expect(posts(effects).at(-1)?.text).toContain("<#727272727>");
+  expect(threads(effects).length).toBe(2); // r1 + r2 — never a third
+  expect(otherEffectKinds(effects)).toEqual([]);
 });
 
 test("a missing agent-state bundle only soft-skips dashboard regen — transitions still persist", () => {
@@ -438,7 +585,7 @@ test("the created DB carries agent-state's schema_migrations bookkeeping (versio
   store.close();
 });
 
-test("rehydration on a second hello never duplicates or clobbers live sessions", () => {
+test("a mid-life second hello (host reconnect) never disturbs live onboardings", () => {
   const dir = tempInstanceDir();
   const store = openStore(dir);
   const { brain, effects } = recorder(store);

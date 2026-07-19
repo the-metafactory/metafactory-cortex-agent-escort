@@ -110,8 +110,9 @@ Three consequences, all load-bearing:
    create, so the gap is safe); a rejected thread request terminates
    `failed`.
 2. **Sessions outlive tasks.** A newcomer's onboarding session spans many
-   tasks; it lives in the in-memory map + the agent-state work_item (keyed by
-   the task_id that *opened* it), never in any single task's lifetime.
+   tasks; it lives in the agent-state work_item (keyed by the task_id that
+   *opened* it, read from the DB on every event), never in any single task's
+   lifetime.
 3. **`onTask` routes by thread context**, on host-provided fields only: the
    task's `source.thread` matching the session's host-resolved thread id →
    an in-thread conversational turn (guidance / readiness / patient hold,
@@ -154,8 +155,9 @@ brain/
   main.ts           daemon socket shell (auth → decode events ⇄ write effects)
   handler.ts        events → effects: the escort's actual behaviour
   protocol.ts       minimal cortex-brain/v1 + create_private_thread (cortex#2206)
-  state.ts          agent-state persistence — fail-soft work_items/events
-                     store + dashboard regen (see "State" below)
+  state.ts          agent-state persistence — the DB-authoritative
+                     read-through store, the memory-only degraded mode,
+                     and dashboard regen (see "State" below)
   config.ts         resolves the principal's chosen name + persona
   env.ts            loads the principal's overlay .env
 scripts/
@@ -163,8 +165,9 @@ scripts/
   scaffold-state.sh         postinstall step 2 — instance state (optional, soft-skips)
 test/
   handler.test.ts   drives the brain, asserts the exact effect stream
-  state.test.ts     persistence: transitions write rows, restart rehydration,
-                     duplicate-mention pointer, missing-DB degradation
+  state.test.ts     persistence: transitions write rows, restart continuity,
+                     external writes visible without restart,
+                     duplicate-mention pointer, missing/dying-DB degradation
 ```
 
 Note what is *absent*, on purpose: no `issue-nats-creds.sh`. The escort runs
@@ -279,6 +282,17 @@ lays down a per-instance home:
 The step **soft-skips** if the bundle isn't installed — the pack installs
 cleanly either way.
 
+**The DB is authoritative, read per event** (v0.4.0). The brain holds no
+long-lived in-memory session map: every mention asks `state.sqlite` "does
+this user have an open onboarding NOW?" and routes on the answer. The
+practical consequence: **external writes take effect on the member's next
+mention, no restart required** — resolving an item with the errands CLI,
+resetting a stuck onboarding, or any other edit made to the DB from another
+process is picked up by the running daemon immediately. Back-office tooling
+built on agent-state (e.g.
+[`metafactory-skill-guild-steward`](https://github.com/the-metafactory/metafactory-skill-guild-steward))
+therefore acts without restarts as of this version.
+
 **What the escort records there** ([`brain/state.ts`](./brain/state.ts)): each
 newcomer's onboarding is one `work_item` of kind `onboarding` (id = the
 task_id that opened it), its status mirroring the session phase within
@@ -293,17 +307,29 @@ agent-state's constrained vocabulary:
 Every transition appends an `event` (append-only audit trail), and
 `dashboard.md` is best-effort regenerated after each change via agent-state's
 own `RegenerateDashboard` workflow — a live back-office view of who's in a
-thread and who's waiting for a welcome. No message text is ever stored: the
-only persisted values are host-provided ids (task/user/thread), each
-length-capped and kept inside JSON columns, so nothing user-authored can reach
-the dashboard.
+thread and who's waiting for a welcome. The engaged heuristic (the "look done
+/ look not done yet" hedge in the surfacing note) is a `turns` counter in the
+work_item's notes JSON, bumped once per conversational turn through the
+annotate discipline — so it survives restarts too. No message text is ever
+stored: the only persisted values are host-provided ids (task/user/thread),
+each length-capped and kept inside JSON columns, plus that integer counter —
+nothing user-authored can reach the dashboard.
 
-**On boot** (the host's `hello` event) the brain rehydrates open items:
-`in_flight`/`waiting_human` rows become live sessions again, so a returning
-user's next mention gets a polite pointer to their existing thread instead of
-a second thread (or silence). Orphaned `pending` rows — a restart ate their
-`thread_created` ack — are resolved `failed`; that user's next mention simply
-retries fresh.
+**The durable-vs-transient line.** Durable MEMBER state — who has an open
+onboarding, its phase, its thread, its turn count — lives in the DB and only
+the DB. The one piece of session-ish process memory left in the brain is
+`pendingThreads`: the in-flight correlation between a `create_private_thread`
+effect and its `thread_created`/`effect_rejected` answer, keyed by task_id —
+per-task effect plumbing scoped to one round-trip, not member state. If the
+process dies, the correlation dies with it and the `pending` row it leaves
+behind is an orphan. Orphans are cleaned two ways (both keyed on "is there a
+live correlation for this row?"): a boot sweep on the host's `hello` resolves
+them `failed` so the dashboard never shows phantom pendings, and a lazy guard
+at read time does the same if one is ever encountered mid-run — so a crash
+between thread request and ack can never permanently block a user; their next
+mention retries fresh. Restarts need no rehydration step at all: the next
+event's DB read finds whatever is open. The DB opens in WAL mode with a busy
+timeout, so external tools can write concurrently while the brain reads.
 
 **Resolving a surfaced item.** A `surfaced` work_item stays open at
 `waiting_human` — the escort never closes it. After saying the welcome,
@@ -314,19 +340,29 @@ MF_INSTANCE_DIR=~/.config/cortex/agents/escort \
   bun <agent-state>/skill/scripts/errands.ts resolve --id <task-id> --status done
 ```
 
-**Fail-soft posture (load-bearing).** State is memory, not authority. A
-missing, corrupt, or unwritable DB logs to stderr and the brain runs
-memory-only with an identical effect stream; boot never fails on state. The
-state layer widens nothing: the effect universe is unchanged, `brain/state.ts`
-has no access to `send`, and the only stored value that ever reaches post text
-is the host-resolved thread id, re-validated against a strict snowflake shape
-after its DB round-trip. Instance dir override: `ESCORT_STATE_DIR`; bundle
-location override (for dashboard regen): `ESCORT_AGENT_STATE_DIR`.
+The resolve is live immediately: the member's next mention starts a fresh
+onboarding (and until then, their duplicate mentions keep getting the polite
+pointer). The same goes for any reset performed directly on the DB.
+
+**Fail-soft posture (load-bearing) — inverted.** State is memory, not
+authority — and the in-memory session map exists ONLY as the degraded mode. A
+DB that is missing/corrupt/unwritable at boot, or that fails a read or write
+mid-run, logs once and flips the brain to a transient memory-only session
+store: identical effect stream, degraded durability only (open onboardings
+held in the DB are not carried over; recovery to DB mode is a restart —
+deliberately no live re-attach complexity). Boot never fails on state. The
+state layer widens nothing: the effect universe is unchanged,
+`brain/state.ts` has no access to `send`, and the only stored value that ever
+reaches post text is the host-resolved thread id, re-validated against a
+strict snowflake shape after its DB round-trip. Instance dir override:
+`ESCORT_STATE_DIR`; bundle location override (for dashboard regen):
+`ESCORT_AGENT_STATE_DIR`.
 
 The remaining planned follow-up is the **hybrid voice upgrade** (an optional
 model-shaped reply layer on top of the same closed effect universe, as a
-host-mediated substrate variant) — planned for v0.4.0 (v0.3.0 shipped the
-back-office notification).
+host-mediated substrate variant) — planned for v0.5.0 (v0.4.0 shipped the
+DB-authoritative read-through state layer; v0.3.0 the back-office
+notification).
 
 ## The load-bearing test
 
@@ -378,7 +414,7 @@ target — not by giving the brain a channel field.
 ```bash
 bun install
 bunx tsc --noEmit
-bun test          # 40 tests — the exact effect stream (hostile input included) + persistence
+bun test          # 45 tests — the exact effect stream (hostile input included) + persistence
 ```
 
 ## Provenance

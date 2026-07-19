@@ -23,10 +23,12 @@ import { openEscortStateFromEnv } from "./state";
 loadBrainEnv();
 const identity = resolveIdentity();
 
-// Durable session memory — an agent-state instance at ESCORT_STATE_DIR
-// (default ~/.config/cortex/agents/escort). FAIL-SOFT by contract: any state
-// problem returns null (state.ts logs to stderr) and the brain runs
-// memory-only, exactly as a stateless install. Boot never fails on state.
+// Durable session state — an agent-state instance at ESCORT_STATE_DIR
+// (default ~/.config/cortex/agents/escort), AUTHORITATIVE and read per event
+// (external writes take effect on the next mention — no restart). FAIL-SOFT
+// by contract: any state problem returns null (state.ts logs to stderr) and
+// the brain serves from a transient memory-only store, exactly as a
+// stateless install. Boot never fails on state.
 const state = openEscortStateFromEnv();
 
 const socketPath = process.env.CORTEX_BRAIN_SOCKET;
