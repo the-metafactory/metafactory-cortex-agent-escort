@@ -223,8 +223,34 @@ export interface CreatePrivateThreadEffect {
   members: CreatePrivateThreadMembers;
 }
 
+/**
+ * `post_log` — post to the AGENT'S OWN bound log channel (cortex#2256; the
+ * back-office channel this pack binds as `ESCORT_LOG_CHANNEL_ID`). Mirrors
+ * the shipped wire shape exactly (`the-metafactory/cortex`
+ * `src/brain/protocol.ts`, `PostLogEffectSchema`): `{ v, type, task_id,
+ * text }` — deliberately NO channel field, the second consumer of
+ * cortex#2206's host-derived-target pattern. The host derives the target
+ * from `presence.discord.logChannelId`; the brain cannot supply one. No
+ * attachment in v1.
+ *
+ * Fire-and-forget: success has NO ack event (unlike `create_private_thread`'s
+ * `thread_created`); a refused or failed one reuses the existing
+ * `effect_rejected` event (`cant_do` = no log channel bound, structural;
+ * `wont_do` = text over the host's 2000-char cap; `policy_denied` = the
+ * host's 10/hour/agent rate limit; `not_now` = transient publish/adapter
+ * failure). A lost log note is a breadcrumb — the agent-state dashboard
+ * stays the durable record (README.md).
+ */
+export interface PostLogEffect {
+  v: 1;
+  type: "post_log";
+  task_id: string;
+  text: string;
+}
+
 export type BrainEffect =
   | PostEffect
+  | PostLogEffect
   | AskPrincipalEffect
   | ResultEffect
   | LogEffect

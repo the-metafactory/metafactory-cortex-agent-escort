@@ -7,6 +7,7 @@ import type {
   BrainEffect,
   CreatePrivateThreadEffect,
   PostEffect,
+  PostLogEffect,
   ResultEffect,
 } from "../brain/protocol";
 
@@ -32,20 +33,30 @@ const source = (user: string, thread = "entry") => ({
 const threads = (fx: BrainEffect[]): CreatePrivateThreadEffect[] =>
   fx.filter((e): e is CreatePrivateThreadEffect => e.type === "create_private_thread");
 const posts = (fx: BrainEffect[]): PostEffect[] => fx.filter((e): e is PostEffect => e.type === "post");
+const postLogs = (fx: BrainEffect[]): PostLogEffect[] =>
+  fx.filter((e): e is PostLogEffect => e.type === "post_log");
 const results = (fx: BrainEffect[]): ResultEffect[] =>
   fx.filter((e): e is ResultEffect => e.type === "result");
 
 /**
- * Every effect kind besides the declared universe — post,
+ * Every effect kind besides the declared universe — post, post_log,
  * create_private_thread, and the terminal `result` — should always be empty.
  * `result` joined the emitted set with the task-lifecycle fix (every
- * processed task must terminate or the bus redelivers it); it was always in
- * the declared universe (protocol.ts BrainEffect) and carries only canned
- * summaries/reasons, asserted separately below.
+ * processed task must terminate or the bus redelivers it); `post_log` joined
+ * with cortex#2256 (the back-office notification) and is emitted by
+ * `surface()` ALONE — carrying only canned copy + host-sourced ids, and
+ * naming no channel (the wire shape has none; the host derives the target).
+ * Both are asserted separately below.
  */
 function otherEffectKinds(fx: BrainEffect[]): string[] {
   return fx
-    .filter((e) => e.type !== "post" && e.type !== "create_private_thread" && e.type !== "result")
+    .filter(
+      (e) =>
+        e.type !== "post" &&
+        e.type !== "post_log" &&
+        e.type !== "create_private_thread" &&
+        e.type !== "result",
+    )
     .map((e) => e.type);
 }
 
@@ -69,6 +80,7 @@ test("a stranger's first mention produces exactly one create_private_thread effe
   expect(created[0]?.name).toContain("alice");
   expect(created[0]?.name).not.toContain("hello");
   expect(otherEffectKinds(effects)).toEqual([]);
+  expect(postLogs(effects).length).toBe(0); // post_log is surface()'s alone
 });
 
 test("the thread id returning triggers exactly one post with the three-things copy", () => {
@@ -101,6 +113,7 @@ test("the thread id returning triggers exactly one post with the three-things co
     { v: 1, type: "result", task_id: "t2", status: "complete", summary: expect.any(String) },
   ]);
   expect(otherEffectKinds(effects)).toEqual([]);
+  expect(postLogs(effects).length).toBe(0); // greeting never notifies the back office
 });
 
 test("a stray thread_created for an unknown task_id produces no effect", () => {
@@ -147,11 +160,13 @@ test("normal conversation only ever produces post effects", () => {
 
   expect(otherEffectKinds(effects)).toEqual([]);
   // create_private_thread(1) + welcome post(1) + greeting-task result(1)
-  // + 2 guidance posts + 1 surface post = 6. `message` events are the
+  // + 2 guidance posts + 1 surface post + 1 surface post_log (the
+  // back-office notification) = 7. `message` events are the
   // normative-protocol compatibility path — they ride an open task, so no
   // per-turn results here (the real host's per-turn tasks are tested below).
-  expect(effects.length).toBe(6);
+  expect(effects.length).toBe(7);
   expect(results(effects).length).toBe(1);
+  expect(postLogs(effects).length).toBe(1);
   expect(posts(effects).at(-1)?.text).toContain("flagged this for a person");
 });
 
@@ -177,6 +192,9 @@ test("CRITICAL: hostile in-thread messages never produce any effect beyond post/
   // post/create_private_thread/result universe, ever.
   expect(effects.length).toBe(3 + hostileMessages.length);
   expect(otherEffectKinds(effects)).toEqual([]);
+  // No hostile message can trigger the back-office notification — post_log
+  // is reachable only through surface()'s readiness path.
+  expect(postLogs(effects).length).toBe(0);
   // None of the replies ever echo a role grant or a #announcements post back as fact.
   for (const p of posts(effects)) {
     expect(p.text.toLowerCase()).not.toContain("granted");
@@ -215,6 +233,7 @@ test("CRITICAL: hostile in-thread TASKS (the real host's per-turn path) stay ins
   expect(effects.length).toBe(before + hostileTurns.length * 2);
   expect(threads(effects).length).toBe(1);
   expect(otherEffectKinds(effects)).toEqual([]);
+  expect(postLogs(effects).length).toBe(0);
   hostileTurns.forEach((_text, i) => {
     const turnResults = results(effects).filter((r) => r.task_id === `t4b-turn-${i}`);
     expect(turnResults.length).toBe(1);
@@ -254,6 +273,9 @@ test("repeated readiness claims surface once, then a patient hold reply — no d
 
   const surfacePosts = posts(effects).filter((p) => p.text.includes("flagged this for a person"));
   expect(surfacePosts.length).toBe(1);
+  // The back-office notification surfaces exactly once too — never
+  // re-notified by repeated readiness claims.
+  expect(postLogs(effects).length).toBe(1);
   expect(otherEffectKinds(effects)).toEqual([]);
 });
 
@@ -423,6 +445,17 @@ test("an in-thread task with a readiness word surfaces (flags a human) instead o
   expect(surfacePost?.text).not.toContain("already have a thread");
   // engaged: they said something before the readiness turn
   expect(surfacePost?.text).toContain("look done");
+  // The back-office notification: exactly one, on the readiness turn's own
+  // task, same hedged verdict, same source user. This session's thread id
+  // ("th-tr") is not a valid snowflake, so the canned fallback replaces the
+  // thread link — never an invalid interpolation.
+  const logNotes = postLogs(effects);
+  expect(logNotes.length).toBe(1);
+  expect(logNotes[0]?.task_id).toBe("tr-3");
+  expect(logNotes[0]?.text).toContain("omar");
+  expect(logNotes[0]?.text).toContain("look done");
+  expect(logNotes[0]?.text).toContain("their onboarding thread");
+  expect(logNotes[0]?.text).not.toContain("<#");
   // every turn's task terminated exactly once
   for (const id of ["tr-2", "tr-3"]) {
     expect(results(effects).filter((x) => x.task_id === id).length).toBe(1);
@@ -440,6 +473,7 @@ test("after surfacing, a further in-thread task gets the patient hold reply and 
   expect(hold?.text).toContain("already let a person know");
   const surfacePosts = posts(effects).filter((p) => p.text.includes("flagged this for a person"));
   expect(surfacePosts.length).toBe(1); // no duplicate surfacing
+  expect(postLogs(effects).length).toBe(1); // and no duplicate back-office note
   expect(results(effects).filter((x) => x.task_id === "tp-3")[0]?.status).toBe("complete");
 });
 
@@ -492,6 +526,87 @@ test("a task with an empty source user is refused with failed/cant_do — it sti
   expect(r[0]?.task_id).toBe("te");
   expect(r[0]?.status).toBe("failed");
   expect(r[0]?.reason?.kind).toBe("cant_do");
+});
+
+// ── back-office notification via post_log (cortex#2256) ────────────────────
+// surface() emits ONE post_log alongside the in-thread note. The effect
+// names no channel (the wire shape has none — the host derives the target
+// from the agent's own logChannelId binding); its text is canned copy + the
+// host-recorded user id + the host-resolved thread id only. Fail-soft: a
+// rejected post_log changes nothing.
+
+test("surfacing emits exactly one post + one post_log + one result on the readiness turn's own task, with the thread link when the id is a valid snowflake", () => {
+  const { brain, effects } = recorder();
+  brain.onEvent(turnTask("s1", "sana", "hi there", "entry"));
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "s1", thread_id: "444555666" });
+  const before = effects.length; // thread + welcome + greeting result
+
+  brain.onEvent(turnTask("s1-2", "sana", "hello, question first", "444555666"));
+  brain.onEvent(turnTask("s1-3", "sana", "ok — I'm ready", "444555666"));
+
+  // The readiness turn's own effects: exactly one post + one post_log + one result.
+  const turn = effects.filter((e) => "task_id" in e && e.task_id === "s1-3");
+  expect(turn.map((e) => e.type)).toEqual(["post", "post_log", "result"]);
+  expect(results(effects).filter((r) => r.task_id === "s1-3")[0]?.status).toBe("complete");
+
+  const note = postLogs(effects)[0];
+  expect(postLogs(effects).length).toBe(1);
+  expect(note?.task_id).toBe("s1-3");
+  // Source user + host-resolved thread link + the same hedged verdict.
+  expect(note?.text).toContain("sana");
+  expect(note?.text).toContain("<#444555666>");
+  expect(note?.text).toContain("look done");
+  // Never message text.
+  expect(note?.text).not.toContain("question first");
+  expect(note?.text).not.toContain("I'm ready");
+  // The wire effect carries NO channel/thread field — nothing to name a target with.
+  expect(note !== undefined && "channel" in note).toBe(false);
+  expect(note !== undefined && "thread" in note).toBe(false);
+
+  expect(effects.length).toBe(before + 2 * 2 + 1); // two turns × (post+result) + the one post_log
+  expect(otherEffectKinds(effects)).toEqual([]);
+});
+
+test("an unengaged readiness claim carries the hedged not-done verdict in BOTH the thread post and the back-office note", () => {
+  const { brain, effects } = openedThread("tomas", "s2");
+  brain.onEvent(turnTask("s2-2", "tomas", "ready", "th-s2"));
+
+  expect(posts(effects).at(-1)?.text).toContain("look not done yet");
+  const note = postLogs(effects)[0];
+  expect(note?.text).toContain("look not done yet");
+  expect(note?.text).toContain("tomas");
+});
+
+test("FAIL-SOFT: a rejected post_log changes nothing — no effects, no result, session state identical", () => {
+  const { brain, effects } = recorder();
+  brain.onEvent(turnTask("f1", "uma", "hi", "entry"));
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "f1", thread_id: "777000111" });
+  brain.onEvent(turnTask("f1-2", "uma", "all set", "777000111"));
+  expect(postLogs(effects).length).toBe(1);
+  const before = effects.length;
+
+  // The host refuses the back-office note (no binding / rate limit / transient).
+  for (const kind of ["cant_do", "policy_denied", "not_now"]) {
+    brain.onEvent({
+      v: 1,
+      type: "effect_rejected",
+      task_id: "f1-2",
+      effect: "post_log",
+      reason: { kind, detail: "log channel unavailable" },
+    });
+  }
+
+  // Nothing emitted — no retry, no result, no error post into the thread.
+  expect(effects.length).toBe(before);
+
+  // Session state identical: still surfaced (patient hold, not re-surface)…
+  brain.onEvent(turnTask("f1-3", "uma", "I'm ready, hello?", "777000111"));
+  expect(posts(effects).at(-1)?.text).toContain("already let a person know");
+  expect(postLogs(effects).length).toBe(1); // no second back-office note
+  // …and the channel-duplicate pointer still knows the thread.
+  brain.onEvent(turnTask("f1-4", "uma", "hello again", "entry"));
+  expect(posts(effects).at(-1)?.text).toContain("<#777000111>");
+  expect(otherEffectKinds(effects)).toEqual([]);
 });
 
 test("the brain never throws on hello, gate_verdict, effect_rejected, or shutdown", () => {

@@ -17,12 +17,16 @@
  * `openOnboarding` gate is what lets an unmapped sender reach it at all, with
  * a zero-authority anon principal. Two invariants hold everywhere below:
  *
- *   1. The ONLY effects this file ever emits are `post`,
+ *   1. The ONLY effects this file ever emits are `post`, `post_log` (from
+ *      `surface()` alone — the back-office notification, cortex#2256),
  *      `create_private_thread`, and the terminal `result`. There is no code
  *      path to `ask_principal`, and `create_private_thread` is only ever
  *      emitted with `members: "source"` — never anything derived from
  *      message text. `result` carries only canned summaries/reasons — never
- *      message text.
+ *      message text. `post_log` carries only canned copy + host-sourced ids
+ *      (source user, host-resolved thread id) — never message text — and
+ *      names no channel (the wire shape has no channel field; the host
+ *      derives the target from the agent's own logChannelId binding).
  *   2. Every parameter of `create_private_thread` comes from the event
  *      SOURCE (`task.source.user`), never from `task.payload` or message
  *      text. Message/task text is read ONLY to decide which canned reply to
@@ -430,6 +434,15 @@ export class EscortBrain {
    * fresh, which is exactly what the session drop is for.
    */
   private onEffectRejected(event: EffectRejectedEvent): void {
+    // cortex#2256 FAIL-SOFT, explicit and load-bearing: a rejected `post_log`
+    // (no log channel bound, host rate limit, transient publish failure)
+    // changes NOTHING — no session/phase change, no work_item transition, no
+    // effect, no result (the surfacing turn emitted its own terminal
+    // `result` synchronously right after the post_log; no result is owed
+    // here). The in-thread flow and the agent-state dashboard — the durable
+    // record — are already settled; the back-office notification is a
+    // best-effort breadcrumb on top.
+    if (event.effect === "post_log") return;
     if (event.effect !== "create_private_thread") return;
     const session = this.sessions.get(event.task_id);
     if (session === undefined || session.phase !== "thread_requested") return;
@@ -497,13 +510,27 @@ export class EscortBrain {
   }
 
   /**
-   * Surface readiness to a human. `PostEffect` (protocol.ts) has no field to
-   * target a channel other than wherever `task_id` already routes — so this
-   * cannot address the back-office channel directly with the current
-   * protocol; it posts into the thread itself instead. See README.md for the
-   * cross-channel routing follow-up this maps to.
+   * Surface readiness to a human — BOTH halves (cortex#2256 closed the old
+   * cross-channel gap):
    *
-   * The post routes via the CURRENT turn's task (`replyTaskId`); the state
+   *   1. The in-thread note to the newcomer (unchanged): a `post` on the
+   *      current turn's task, routed by the host to the session's thread.
+   *   2. ONE `post_log` — the back-office notification. The effect names NO
+   *      channel (the wire shape has none); the host derives the target from
+   *      the agent's own `presence.discord.logChannelId` binding
+   *      (`ESCORT_LOG_CHANNEL_ID` in this pack's wiring). Text is canned
+   *      copy + the host-recorded source user, the thread link (`<#id>` —
+   *      only when the session carries a validated host-resolved thread id;
+   *      see SNOWFLAKE), and the SAME hedged verdict as the in-thread note.
+   *      Never message text.
+   *
+   * FIRE-AND-FORGET + FAIL-SOFT: `post_log` has no success ack, and a
+   * rejected one (`effect_rejected` — no binding, rate limit, host down)
+   * changes nothing: session phase, work_item state, and the in-thread flow
+   * are all already settled before the effect is even emitted; the
+   * agent-state dashboard stays the durable record (see onEffectRejected).
+   *
+   * The posts route via the CURRENT turn's task (`replyTaskId`); the state
    * transition records against the session's OWN originating task id — the
    * agent-state work_item key (they differ whenever the readiness turn is a
    * later task, which under the real host it always is).
@@ -523,6 +550,20 @@ export class EscortBrain {
       type: "post",
       task_id: replyTaskId,
       text: `Thanks, ${session.user} — I've flagged this for a person. The three things ${verdict}. They'll be along to say hi.`,
+    });
+    // The back-office notification. The thread pointer only when the
+    // host-resolved id re-proves its snowflake shape (it may have
+    // round-tripped through the state DB — same rule as
+    // duplicateMentionCopy); otherwise the canned fallback.
+    const where =
+      session.threadId !== null && SNOWFLAKE.test(session.threadId)
+        ? `<#${session.threadId}>`
+        : "their onboarding thread";
+    this.deps.send({
+      v: 1,
+      type: "post_log",
+      task_id: replyTaskId,
+      text: `${session.user} says they're ready in ${where} — the three things ${verdict}. A person should come say hi.`,
     });
   }
 

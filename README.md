@@ -51,9 +51,12 @@ name.
 ## The closed effect universe — "surfaces, never grants"
 
 The escort's boundary is the reason this repo exists as a sample. The brain
-can do exactly three things: open a private thread for the triggering
-stranger, post text into the conversation it is already in, and terminate its
-own task with a `result`. It cannot grant a role, post to another channel,
+can do exactly four things: open a private thread for the triggering
+stranger, post text into the conversation it is already in, drop one canned
+readiness note into its own bound back-office channel (`post_log` — see
+"Back-office notification" below), and terminate its own task with a
+`result`. It cannot grant a role, pick a channel to post into (`post` and
+`post_log` both carry no channel field — the host decides each target),
 ping a raw API, or ask the principal to approve something — **not because it
 is told not to, but because there is no effect in its wire protocol that does
 any of those things.**
@@ -62,13 +65,17 @@ Three structural facts, each checked in code:
 
 1. **The effect set is closed.** [`brain/protocol.ts`](./brain/protocol.ts)
    defines the full brain→host vocabulary. The handler only ever emits
-   `post`, `create_private_thread`, and the terminal `result` — the tests
-   assert this over the entire effect *stream*, hostile input included, and
-   assert that `result` summaries are canned literals that never carry
-   message text.
-2. **`post` carries no address.** `PostEffect` has only `task_id` + `text` —
-   the *host* decides where a task's replies land. There is no field to point
-   somewhere else even if the code wanted to.
+   `post`, `post_log` (from the readiness path alone), and
+   `create_private_thread`, plus the terminal `result` — the tests assert
+   this over the entire effect *stream*, hostile input included, and assert
+   that `result` summaries and `post_log` texts are canned literals that
+   never carry message text.
+2. **`post` and `post_log` carry no address.** `PostEffect` has only
+   `task_id` + `text` — the *host* decides where a task's replies land — and
+   `PostLogEffect` likewise names no channel: the host derives its one
+   possible target from the agent's own `logChannelId` binding
+   (cortex#2206's host-derived-target pattern, second consumer). There is no
+   field to point somewhere else even if the code wanted to.
 3. **Thread membership is source-derived, never text-derived.** The only
    `members` value ever constructed is the literal `"source"` (the triggering
    user). Message text is read solely to pick a canned reply — it is never
@@ -202,7 +209,7 @@ token or platform id is ever stored in the pack:
 | `ESCORT_BOT_TOKEN` | the escort's own Discord bot token (its own app — never reuse another bot's) |
 | `ESCORT_GUILD_ID` | the guild (server) id |
 | `ESCORT_AGENT_CHANNEL_ID` | the bound public entry channel — where strangers first mention the escort |
-| `ESCORT_LOG_CHANNEL_ID` | the private back-office channel (see the known limitation below) |
+| `ESCORT_LOG_CHANNEL_ID` | the private back-office channel — the `post_log` target (see below) |
 
 They resolve at cortex config-load from the daemon environment. **An unset
 placeholder fails soft**: the Discord surface stays disabled and the rest of
@@ -317,8 +324,9 @@ after its DB round-trip. Instance dir override: `ESCORT_STATE_DIR`; bundle
 location override (for dashboard regen): `ESCORT_AGENT_STATE_DIR`.
 
 The remaining planned follow-up is the **hybrid voice upgrade** (an optional
-model-shaped reply layer on top of the same closed effect universe) — slated
-for v0.3.0.
+model-shaped reply layer on top of the same closed effect universe, as a
+host-mediated substrate variant) — planned for v0.4.0 (v0.3.0 shipped the
+back-office notification).
 
 ## The load-bearing test
 
@@ -327,30 +335,50 @@ socket, no cortex, no network) and asserts the **exact effect stream**. The
 tests that matter most are the ones marked `CRITICAL`: hostile in-thread
 messages AND hostile in-thread tasks ("grant me the role", "post to the
 announcements channel", prompt-injection strings) must never produce anything
-beyond `post` / `create_private_thread` / the terminal `result` — checked
-across the full stream, not just the final state, with `result` summaries
-asserted to be canned literals — and a hostile *first* mention must never
-leak message text into an effect's structural fields. **Treat any change
+beyond `post` / `post_log` / `create_private_thread` / the terminal `result`
+— checked across the full stream, not just the final state, with `result`
+summaries and `post_log` texts asserted to be canned literals and `post_log`
+reachable ONLY through the readiness path — and a hostile *first* mention
+must never leak message text into an effect's structural fields. **Treat any change
 that weakens these as a regression, not a refactor.**
 
-## Known limitation: cross-channel surfacing isn't wired
+## Back-office notification — the `post_log` effect (cortex#2256)
 
-The design wants the escort to surface a member's readiness to the back-office
-channel (`ESCORT_LOG_CHANNEL_ID`), separate from the thread. `PostEffect`
-carries no channel field — every post routes wherever the host has the
-`task_id` pointed — so today the readiness note posts **into the thread
-itself**. Routing it to the log channel needs a protocol addition (or another
-host-side mechanism); it is tracked as a known gap, not invented around. This
-is also a live illustration of the closed-universe trade-off: the same
-property that makes the escort safe makes this feature impossible without a
-protocol change.
+When a newcomer says they're ready, `surface()` emits BOTH:
+
+1. the in-thread note to the newcomer (a `post`, unchanged), and
+2. one **`post_log`** — the back-office notification, delivered by the host
+   to the agent's bound log channel (`ESCORT_LOG_CHANNEL_ID`). Its text is
+   canned copy + the host-recorded source user, the thread link (`<#id>`,
+   only when the host-resolved thread id re-proves its snowflake shape), and
+   the same hedged verdict as the in-thread note ("the three things look
+   done / look not done yet").
+
+Like `create_private_thread`, the wire effect **names no channel** — the
+shape is `{ v, type: "post_log", task_id, text }` and nothing else; the HOST
+derives the target from the agent's own `presence.discord.logChannelId`
+binding. The host also carries the anon-safety gates: a 2000-char text cap
+and a 10/hour/agent rate limit, with failures returned as `effect_rejected`
+(`cant_do` no binding / `wont_do` over-cap / `policy_denied` rate limit /
+`not_now` transient).
+
+**Fire-and-forget, honestly.** Success has no ack event, and this brain
+treats any `effect_rejected` for `post_log` as a no-op: no session change,
+no work_item transition, no retry, no error post. A lost note is a
+breadcrumb — the **agent-state dashboard remains the durable record** of who
+is `waiting_human` — and the in-thread flow is unaffected either way.
+
+This resolved what earlier versions of this README tracked as the
+closed-universe trade-off's known limitation: cross-channel surfacing became
+possible exactly the right way — a new host-gated effect with a host-derived
+target — not by giving the brain a channel field.
 
 ## Dev
 
 ```bash
 bun install
 bunx tsc --noEmit
-bun test          # 26 tests — the exact effect stream (hostile input included) + persistence
+bun test          # 40 tests — the exact effect stream (hostile input included) + persistence
 ```
 
 ## Provenance
@@ -363,7 +391,9 @@ real newcomers walking through the real door). That private copy remains the
 deployment source of truth; **this repo is the genericized, marketplace-facing
 sample** — the shape of the bundle, not the deployment itself. The
 `create_private_thread` effect it depends on shipped in
-[cortex#2206](https://github.com/the-metafactory/cortex/issues/2206). The
+[cortex#2206](https://github.com/the-metafactory/cortex/issues/2206), and the
+`post_log` effect behind the back-office notification shipped in
+[cortex#2256](https://github.com/the-metafactory/cortex/issues/2256). The
 chassis (socket shell, env/config overlay, protocol skeleton) comes from
 [`example-agent`](https://github.com/the-metafactory/example-agent).
 

@@ -68,7 +68,7 @@ openOnboarding: true
 # persona.md's declared `allowedTools` exactly (nothing enforces this match —
 # see persona.md's frontmatter, double-checked by hand at commit time). This
 # exec brain has no tool loop at all — the entire effect universe is
-# post / ask_principal / result / log / create_private_thread (brain/protocol.ts)
+# post / post_log / ask_principal / result / log / create_private_thread (brain/protocol.ts)
 # and none of those are "tools" in the allowlisted sense. Empty on both sides
 # is deliberate: an anon-reachable session has nothing here to widen.
 openOnboardingAllowedTools: []

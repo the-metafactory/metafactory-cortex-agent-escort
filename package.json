@@ -1,6 +1,6 @@
 {
   "name": "metafactory-cortex-agent-escort",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Escort — deterministic cortex onboarding greeter. Exec brain, surfaces to a human, never grants.",
   "type": "module",
   "private": true,

@@ -76,11 +76,18 @@ const helloEvent = () =>
 const threads = (fx: BrainEffect[]): CreatePrivateThreadEffect[] =>
   fx.filter((e): e is CreatePrivateThreadEffect => e.type === "create_private_thread");
 const posts = (fx: BrainEffect[]): PostEffect[] => fx.filter((e): e is PostEffect => e.type === "post");
-// The declared effect universe is post + create_private_thread + result (the
-// per-task terminal, part of the task-lifecycle fix) — anything else is a breach.
+// The declared effect universe is post + post_log (surface()'s back-office
+// notification, cortex#2256) + create_private_thread + result (the per-task
+// terminal, part of the task-lifecycle fix) — anything else is a breach.
 const otherEffectKinds = (fx: BrainEffect[]): string[] =>
   fx
-    .filter((e) => e.type !== "post" && e.type !== "create_private_thread" && e.type !== "result")
+    .filter(
+      (e) =>
+        e.type !== "post" &&
+        e.type !== "post_log" &&
+        e.type !== "create_private_thread" &&
+        e.type !== "result",
+    )
     .map((e) => e.type);
 
 function rawDb(dir: string): Database {
@@ -243,6 +250,42 @@ test("an in-thread readiness TASK (fresh task_id) parks the ORIGINAL work_item a
     .all();
   expect(turnRows.length).toBe(0); // turn tasks never create their own work_items
   db.close();
+  store.close();
+});
+
+test("a rejected post_log leaves the work_item state identical — still waiting_human, no closing event (cortex#2256 fail-soft)", () => {
+  const dir = tempInstanceDir();
+  const store = openStore(dir);
+  const { brain, effects } = recorder(store);
+
+  brain.onEvent(taskEvent("t-pl", "4701"));
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "t-pl", thread_id: "343434343" });
+  brain.onEvent(taskEvent("t-pl-turn", "4701", "343434343", "all done, ready!"));
+
+  const db1 = rawDb(dir);
+  const beforeRow = db1.query("SELECT status FROM work_items WHERE id = 't-pl'").get() as { status: string };
+  const beforeEvents = (db1.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+  db1.close();
+  expect(beforeRow.status).toBe("waiting_human");
+  const beforeEffects = effects.length;
+
+  // The host refuses the back-office notification.
+  brain.onEvent({
+    v: 1,
+    type: "effect_rejected",
+    task_id: "t-pl-turn",
+    effect: "post_log",
+    reason: { kind: "policy_denied", detail: "rate limited" },
+  });
+
+  // Identical: no new effect, the row still parked, no extra event appended.
+  expect(effects.length).toBe(beforeEffects);
+  const db2 = rawDb(dir);
+  const afterRow = db2.query("SELECT status FROM work_items WHERE id = 't-pl'").get() as { status: string };
+  const afterEvents = (db2.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+  db2.close();
+  expect(afterRow.status).toBe("waiting_human");
+  expect(afterEvents).toBe(beforeEvents);
   store.close();
 });
 
