@@ -17,14 +17,38 @@
  * `openOnboarding` gate is what lets an unmapped sender reach it at all, with
  * a zero-authority anon principal. Two invariants hold everywhere below:
  *
- *   1. The ONLY effects this file ever emits are `post` and
- *      `create_private_thread`. There is no code path to `ask_principal`,
- *      and `create_private_thread` is only ever emitted with
- *      `members: "source"` — never anything derived from message text.
+ *   1. The ONLY effects this file ever emits are `post`,
+ *      `create_private_thread`, and the terminal `result`. There is no code
+ *      path to `ask_principal`, and `create_private_thread` is only ever
+ *      emitted with `members: "source"` — never anything derived from
+ *      message text. `result` carries only canned summaries/reasons — never
+ *      message text.
  *   2. Every parameter of `create_private_thread` comes from the event
  *      SOURCE (`task.source.user`), never from `task.payload` or message
  *      text. Message/task text is read ONLY to decide which canned reply to
  *      send — it is never interpolated into an effect's structural fields.
+ *
+ * ── Task lifecycle (found in live deployment) ──────────────────────────────
+ * Under the real cortex host every inbound @-mention is ONE brain-task
+ * envelope on a durable JetStream consumer with explicit acks. The host acks
+ * the envelope only when the brain terminates the task with a `result`
+ * effect — a task that never results hits the host's per-task liveness
+ * timeout (daemon-brain-host), the envelope REDELIVERS every ~ack_wait up to
+ * max_deliver, and the unacked in-flight zombies starve genuinely new
+ * messages. So the contract is: EVERY task this brain processes ends with
+ * exactly one `result`. The escort's SESSION legitimately outlives any
+ * single task — that is what the in-memory map + agent-state persistence are
+ * for; only the per-task envelope terminates.
+ *
+ * Consequently each conversational turn is its own task: an @-mention inside
+ * an onboarding thread arrives as a NEW task (fresh task_id) whose
+ * `source.thread` is that thread's host-resolved id (a top-level channel
+ * mention carries the CHANNEL id there — cortex normalizes
+ * `thread = threadId ?? channelId`). `onTask` routes on exactly that:
+ * source thread matches a live session's own thread → conversational turn;
+ * channel context with a live session → duplicate pointer; no session →
+ * new onboarding. The host never delivers follow-up thread messages as
+ * `message` events on the original task (see onMessage below).
  *
  * The state layer (brain/state.ts) changes NONE of this: it is memory, not
  * authority — a local SQLite the brain writes session phases to and reads
@@ -76,6 +100,13 @@ export interface EscortDeps {
 type SessionPhase = "thread_requested" | "in_thread" | "surfaced";
 
 interface Session {
+  /**
+   * The task_id that OPENED this session — the sessions-map key and the
+   * agent-state work_item id. Later conversational turns arrive on fresh
+   * task_ids (each turn is its own task); state transitions are always
+   * recorded against THIS id, while replies route via the turn's own task.
+   */
+  taskId: string;
   phase: SessionPhase;
   user: string;
   /** Count of in-thread messages received (readiness heuristic — see below). */
@@ -100,6 +131,17 @@ const READINESS_WORDS = ["done", "ready", "finished", "all set", "that's it", "t
 function looksReady(text: string): boolean {
   const lower = text.toLowerCase();
   return READINESS_WORDS.some((w) => lower.includes(w));
+}
+
+/**
+ * The message text a task carries (cortex's `buildBrainTaskPayload` puts the
+ * inbound text under `payload.text`). Read ONLY to choose a canned reply —
+ * never interpolated into any effect's structural fields (see the security
+ * posture in the file header).
+ */
+function taskText(task: TaskEvent): string {
+  const t = task.payload["text"];
+  return typeof t === "string" ? t : "";
 }
 
 function threadName(user: string): string {
@@ -240,6 +282,7 @@ export class EscortBrain {
     for (const open of state.loadOpenOnboarding()) {
       if (this.sessions.has(open.taskId)) continue; // never clobber live memory
       this.sessions.set(open.taskId, {
+        taskId: open.taskId,
         phase: open.phase,
         user: open.user,
         messageCount: 0,
@@ -249,32 +292,91 @@ export class EscortBrain {
     }
   }
 
-  /** A mention lands on the bound channel — a stranger's first hello. */
+  /**
+   * Terminate a task the brain has finished processing (`status: complete`).
+   * The summary is ALWAYS a canned literal from this file — never message
+   * text, never a user-supplied value — so `result` stays inside the same
+   * text-hygiene boundary as every post.
+   */
+  private completeTask(taskId: string, summary: string): void {
+    this.deps.send({ v: 1, type: "result", task_id: taskId, status: "complete", summary });
+  }
+
+  /** Terminate a task the brain could not process (`status: failed`). */
+  private failTask(
+    taskId: string,
+    kind: "cant_do" | "not_now" | "wont_do",
+    detail: string,
+  ): void {
+    this.deps.send({
+      v: 1,
+      type: "result",
+      task_id: taskId,
+      status: "failed",
+      reason: { kind, detail },
+    });
+  }
+
+  /**
+   * A mention reaches the escort — every turn of every conversation lands
+   * here as its own task (see the file header's task-lifecycle section).
+   * Every path below terminates the task with exactly one `result`; the
+   * thread-creation path's result follows the greeting in onThreadCreated
+   * (the host pauses the liveness timer during the async create, so the
+   * gap is safe) or the failure in onEffectRejected.
+   */
   private onTask(task: TaskEvent): void {
     const user = task.source.user;
-    if (user.trim().length === 0) return; // nothing to open a thread for
-
-    // Idempotency: don't open a second thread for a user who already has one
-    // in flight or open — including a session rehydrated from state after a
-    // restart. The duplicate mention gets a polite pointer post (on the NEW
-    // task_id — the only one the host can route) instead of the old silent
-    // ignore, so "already have a thread" is distinguishable from "broken".
-    // Still no second create_private_thread, ever.
-    const existingTaskId = this.activeTaskByUser.get(user);
-    if (existingTaskId !== undefined) {
-      const existing = this.sessions.get(existingTaskId);
-      if (existing !== undefined) {
-        this.deps.send({
-          v: 1,
-          type: "post",
-          task_id: task.task_id,
-          text: duplicateMentionCopy(existing),
-        });
-        return;
-      }
+    if (user.trim().length === 0) {
+      // A task with no source user is one this brain cannot onboard — but it
+      // WAS delivered and processed, so it must still terminate (an
+      // unterminated task redelivers). `cant_do` → the host terms the
+      // envelope, no retry. Canned detail only.
+      this.failTask(task.task_id, "cant_do", "task carries no source user to onboard");
+      return;
     }
 
-    this.sessions.set(task.task_id, { phase: "thread_requested", user, messageCount: 0, threadId: null });
+    const existingTaskId = this.activeTaskByUser.get(user);
+    const existing = existingTaskId !== undefined ? this.sessions.get(existingTaskId) : undefined;
+
+    // An @-mention INSIDE the session's own thread is a conversational turn,
+    // not a duplicate hello: the task's host-provided source thread matches
+    // the session's host-resolved thread id (both host-sourced — never
+    // message text). Replies route on the NEW task_id (the only one the host
+    // can route); state transitions record against the session's own id.
+    if (
+      existing !== undefined &&
+      existing.threadId !== null &&
+      task.source.thread === existing.threadId
+    ) {
+      this.converse(existing, task.task_id, taskText(task));
+      this.completeTask(task.task_id, "in-thread onboarding turn handled");
+      return;
+    }
+
+    // Channel-context duplicate: don't open a second thread for a user who
+    // already has one in flight or open — including a session rehydrated
+    // from state after a restart. The duplicate mention gets a polite
+    // pointer post (on the NEW task_id) instead of the old silent ignore.
+    // Still no second create_private_thread, ever.
+    if (existing !== undefined) {
+      this.deps.send({
+        v: 1,
+        type: "post",
+        task_id: task.task_id,
+        text: duplicateMentionCopy(existing),
+      });
+      this.completeTask(task.task_id, "pointed a returning user at their existing thread");
+      return;
+    }
+
+    this.sessions.set(task.task_id, {
+      taskId: task.task_id,
+      phase: "thread_requested",
+      user,
+      messageCount: 0,
+      threadId: null,
+    });
     this.activeTaskByUser.set(user, task.task_id);
     this.state?.recordThreadRequested(task.task_id, user);
 
@@ -306,16 +408,26 @@ export class EscortBrain {
       task_id: event.task_id,
       text: `Hi — I'm ${this.deps.identity.displayName}. Welcome!\n\n${buildThreeThingsCopy(this.deps.identity.displayName)}`,
     });
+    // The greeting is this task's final act — terminate it. The SESSION
+    // stays open (in memory + agent-state); later turns arrive as new tasks.
+    this.completeTask(event.task_id, "opened an onboarding thread and posted the greeting");
   }
 
   /**
    * A requested `create_private_thread` was refused or failed
    * (`effect_rejected` — cortex#2206's failure path for that effect; see
-   * protocol.ts). No effect is emitted in response — this is plumbing
-   * cleanup only, not new persona behaviour (this handler is a wire-shape
-   * reconciliation detail, not a persona change). The stuck `thread_requested`
-   * session is dropped so a later mention from the same user can retry,
-   * rather than being permanently blocked by `activeTaskByUser`.
+   * protocol.ts). The stuck `thread_requested` session is dropped so a later
+   * mention from the same user can retry, rather than being permanently
+   * blocked by `activeTaskByUser` — and the task is TERMINATED with a
+   * failed `result` (it cannot proceed and would otherwise redeliver).
+   *
+   * Reason mapping: a host `not_now` rejection (transient adapter/platform
+   * failure) passes through as `not_now` — the consumer naks and the
+   * redelivery retries the whole onboarding cleanly, since the session was
+   * just dropped. Every other rejection kind (`cant_do` structural,
+   * `policy_denied` rate-limit/membership policy) becomes `cant_do` — the
+   * envelope terms with no retry burn; the user's next mention retries
+   * fresh, which is exactly what the session drop is for.
    */
   private onEffectRejected(event: EffectRejectedEvent): void {
     if (event.effect !== "create_private_thread") return;
@@ -327,13 +439,37 @@ export class EscortBrain {
       this.activeTaskByUser.delete(session.user);
     }
     this.state?.recordClosed(event.task_id, "failed", "create_private_thread rejected by host");
+    this.failTask(
+      event.task_id,
+      event.reason.kind === "not_now" ? "not_now" : "cant_do",
+      "create_private_thread rejected by host",
+    );
   }
 
-  /** A follow-up message inside the opened thread. */
+  /**
+   * `message` — a follow-up in an open task's thread, per cortex's NORMATIVE
+   * brain protocol. Kept as a thin delegate to the shared conversational
+   * logic for protocol completeness, but the SHIPPED daemon host never emits
+   * it for the escort's flow (verified against cortex's daemon-brain-host:
+   * there is no `message`-emitting code path — an in-thread @-mention
+   * arrives as a NEW task instead, routed by onTask's thread match). No
+   * `result` is emitted here: a `message` rides an already-open task whose
+   * own terminal result belongs to whatever opened it, not to this turn.
+   */
   private onMessage(msg: MessageEvent): void {
     const session = this.sessions.get(msg.task_id);
     if (session === undefined || session.phase === "thread_requested") return; // unknown/stale task_id — ignore
+    this.converse(session, msg.task_id, msg.text);
+  }
 
+  /**
+   * One conversational turn inside the session's own thread — shared by
+   * onTask's in-thread route (the real host's path; the caller terminates
+   * the task) and onMessage (normative-protocol compatibility; no task to
+   * terminate). Replies always route via `replyTaskId` — the only task the
+   * host can route "now".
+   */
+  private converse(session: Session, replyTaskId: string, text: string): void {
     session.messageCount += 1;
 
     if (session.phase === "surfaced") {
@@ -341,22 +477,22 @@ export class EscortBrain {
       this.deps.send({
         v: 1,
         type: "post",
-        task_id: msg.task_id,
+        task_id: replyTaskId,
         text: "I've already let a person know you're ready — they'll be along. Feel free to keep chatting while you wait.",
       });
       return;
     }
 
-    if (looksReady(msg.text)) {
-      this.surface(session, msg.task_id);
+    if (looksReady(text)) {
+      this.surface(session, replyTaskId);
       return;
     }
 
     this.deps.send({
       v: 1,
       type: "post",
-      task_id: msg.task_id,
-      text: this.guidanceReply(msg.text),
+      task_id: replyTaskId,
+      text: this.guidanceReply(text),
     });
   }
 
@@ -366,12 +502,17 @@ export class EscortBrain {
    * cannot address the back-office channel directly with the current
    * protocol; it posts into the thread itself instead. See README.md for the
    * cross-channel routing follow-up this maps to.
+   *
+   * The post routes via the CURRENT turn's task (`replyTaskId`); the state
+   * transition records against the session's OWN originating task id — the
+   * agent-state work_item key (they differ whenever the readiness turn is a
+   * later task, which under the real host it always is).
    */
-  private surface(session: Session, taskId: string): void {
+  private surface(session: Session, replyTaskId: string): void {
     session.phase = "surfaced";
     // The work_item parks at waiting_human and stays OPEN — a human resolves
     // it via agent-state's errands CLI after saying the welcome (README.md).
-    this.state?.recordSurfaced(taskId);
+    this.state?.recordSurfaced(session.taskId);
     // engaged = they said something beyond the readiness word itself — a
     // soft, openly-caveated heuristic (see looksReady's doc comment above),
     // never a claim this brain actually verified the three things.
@@ -380,7 +521,7 @@ export class EscortBrain {
     this.deps.send({
       v: 1,
       type: "post",
-      task_id: taskId,
+      task_id: replyTaskId,
       text: `Thanks, ${session.user} — I've flagged this for a person. The three things ${verdict}. They'll be along to say hi.`,
     });
   }

@@ -51,18 +51,21 @@ name.
 ## The closed effect universe — "surfaces, never grants"
 
 The escort's boundary is the reason this repo exists as a sample. The brain
-can do exactly two things: open a private thread for the triggering stranger,
-and post text into the conversation it is already in. It cannot grant a role,
-post to another channel, ping a raw API, or ask the principal to approve
-something — **not because it is told not to, but because there is no effect in
-its wire protocol that does any of those things.**
+can do exactly three things: open a private thread for the triggering
+stranger, post text into the conversation it is already in, and terminate its
+own task with a `result`. It cannot grant a role, post to another channel,
+ping a raw API, or ask the principal to approve something — **not because it
+is told not to, but because there is no effect in its wire protocol that does
+any of those things.**
 
 Three structural facts, each checked in code:
 
 1. **The effect set is closed.** [`brain/protocol.ts`](./brain/protocol.ts)
-   defines the full brain→host vocabulary. The handler only ever emits `post`
-   and `create_private_thread` — the tests assert this over the entire effect
-   *stream*, hostile input included.
+   defines the full brain→host vocabulary. The handler only ever emits
+   `post`, `create_private_thread`, and the terminal `result` — the tests
+   assert this over the entire effect *stream*, hostile input included, and
+   assert that `result` summaries are canned literals that never carry
+   message text.
 2. **`post` carries no address.** `PostEffect` has only `task_id` + `text` —
    the *host* decides where a task's replies land. There is no field to point
    somewhere else even if the code wanted to.
@@ -78,6 +81,37 @@ grant effect is physics.
 
 Granting membership is a human act (or a separate, trusted skill's job) —
 never this pack's.
+
+## Conversation model — every turn is its own task
+
+Found in live deployment: under the real cortex host, every inbound
+@-mention — the first hello on the bound channel AND every later reply inside
+the onboarding thread — arrives as its **own brain task** (a fresh `task_id`
+on a durable JetStream envelope with explicit acks). The host never delivers
+follow-up thread messages as `message` events on the original task;
+`onMessage` survives only as a thin compatibility delegate for cortex's
+normative protocol shape.
+
+Three consequences, all load-bearing:
+
+1. **Every processed task terminates with exactly one `result`** — that is
+   what acks the bus envelope. A task that never results hits the host's
+   per-task liveness timeout and REDELIVERS (observed live: the same mention
+   reprocessed several times, and unacked in-flight zombies starving a
+   genuinely new message). The thread-creation task's result follows the
+   greeting post (the host pauses the liveness timer during the async
+   create, so the gap is safe); a rejected thread request terminates
+   `failed`.
+2. **Sessions outlive tasks.** A newcomer's onboarding session spans many
+   tasks; it lives in the in-memory map + the agent-state work_item (keyed by
+   the task_id that *opened* it), never in any single task's lifetime.
+3. **`onTask` routes by thread context**, on host-provided fields only: the
+   task's `source.thread` matching the session's host-resolved thread id →
+   an in-thread conversational turn (guidance / readiness / patient hold,
+   replying on the new task); channel context with a live session → the
+   polite duplicate pointer; no session → new onboarding. (Cortex normalizes
+   `thread = threadId ?? channelId`, so a top-level mention carries the
+   channel id there.)
 
 ## The openOnboarding anon-gate
 
@@ -290,13 +324,14 @@ for v0.3.0.
 
 [`test/handler.test.ts`](./test/handler.test.ts) drives the brain directly (no
 socket, no cortex, no network) and asserts the **exact effect stream**. The
-tests that matter most are the two marked `CRITICAL`: hostile in-thread
-messages ("grant me the role", "post to the announcements channel",
-prompt-injection strings) must never produce anything beyond `post` /
-`create_private_thread` — checked across the full stream, not just the final
-state — and a hostile *first* mention must never leak message text into an
-effect's structural fields. **Treat any change that weakens these as a
-regression, not a refactor.**
+tests that matter most are the ones marked `CRITICAL`: hostile in-thread
+messages AND hostile in-thread tasks ("grant me the role", "post to the
+announcements channel", prompt-injection strings) must never produce anything
+beyond `post` / `create_private_thread` / the terminal `result` — checked
+across the full stream, not just the final state, with `result` summaries
+asserted to be canned literals — and a hostile *first* mention must never
+leak message text into an effect's structural fields. **Treat any change
+that weakens these as a regression, not a refactor.**
 
 ## Known limitation: cross-channel surfacing isn't wired
 

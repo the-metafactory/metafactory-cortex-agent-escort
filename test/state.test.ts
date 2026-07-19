@@ -53,17 +53,35 @@ function recorder(state: EscortStateStore | null) {
   return { brain, effects };
 }
 
-const source = (user: string) => ({ surface: "discord", channel: "entry", thread: "", user });
-const taskEvent = (taskId: string, user: string) =>
-  ({ v: 1, type: "task", task_id: taskId, capability: "escort.greet", payload: {}, source: source(user) }) as const;
+// The real host normalizes `thread = threadId ?? channelId` — a channel
+// mention carries the channel id; an in-thread turn carries the thread id.
+const source = (user: string, thread = "entry") => ({
+  surface: "discord",
+  channel: "entry",
+  thread,
+  user,
+});
+const taskEvent = (taskId: string, user: string, thread = "entry", text = "") =>
+  ({
+    v: 1,
+    type: "task",
+    task_id: taskId,
+    capability: "escort.greet",
+    payload: text.length > 0 ? { text } : {},
+    source: source(user, thread),
+  }) as const;
 const helloEvent = () =>
   ({ v: 1, type: "hello", agent: "escort", persona: "p", protocol: "cortex-brain/v1" }) as const;
 
 const threads = (fx: BrainEffect[]): CreatePrivateThreadEffect[] =>
   fx.filter((e): e is CreatePrivateThreadEffect => e.type === "create_private_thread");
 const posts = (fx: BrainEffect[]): PostEffect[] => fx.filter((e): e is PostEffect => e.type === "post");
+// The declared effect universe is post + create_private_thread + result (the
+// per-task terminal, part of the task-lifecycle fix) — anything else is a breach.
 const otherEffectKinds = (fx: BrainEffect[]): string[] =>
-  fx.filter((e) => e.type !== "post" && e.type !== "create_private_thread").map((e) => e.type);
+  fx
+    .filter((e) => e.type !== "post" && e.type !== "create_private_thread" && e.type !== "result")
+    .map((e) => e.type);
 
 function rawDb(dir: string): Database {
   return new Database(join(dir, "state.sqlite"), { readonly: true });
@@ -194,6 +212,67 @@ test("RESTART: a surfaced session rehydrates too — pointer post, work_item sti
   const db = rawDb(dir);
   const row = db.query("SELECT status FROM work_items WHERE id = 't-s'").get() as { status: string };
   expect(row.status).toBe("waiting_human"); // still a human's to resolve
+  db.close();
+  storeB.close();
+});
+
+test("an in-thread readiness TASK (fresh task_id) parks the ORIGINAL work_item at waiting_human", () => {
+  const dir = tempInstanceDir();
+  const store = openStore(dir);
+  const { brain, effects } = recorder(store);
+
+  brain.onEvent(taskEvent("t-conv", "conv-user"));
+  brain.onEvent({ v: 1, type: "thread_created", task_id: "t-conv", thread_id: "888999000" });
+  // Each in-thread turn is its own task under the real host — the session's
+  // thread id in source.thread routes it to the conversation, not the pointer.
+  brain.onEvent(taskEvent("t-conv-turn1", "conv-user", "888999000", "quick question about the intro"));
+  brain.onEvent(taskEvent("t-conv-turn2", "conv-user", "888999000", "all done, ready!"));
+
+  // Replies landed on the turn tasks; the surface note is the last post.
+  expect(posts(effects).at(-1)?.task_id).toBe("t-conv-turn2");
+  expect(posts(effects).at(-1)?.text).toContain("flagged this for a person");
+  expect(threads(effects).length).toBe(1);
+  expect(otherEffectKinds(effects)).toEqual([]);
+
+  // The work_item is keyed by the ORIGINATING task id and is now parked.
+  const db = rawDb(dir);
+  const row = db.query("SELECT status FROM work_items WHERE id = 't-conv'").get() as { status: string };
+  expect(row.status).toBe("waiting_human");
+  const turnRows = db
+    .query("SELECT id FROM work_items WHERE id LIKE 't-conv-turn%'")
+    .all();
+  expect(turnRows.length).toBe(0); // turn tasks never create their own work_items
+  db.close();
+  store.close();
+});
+
+test("RESTART: a rehydrated session converses in-thread — a readiness turn surfaces instead of the pointer", () => {
+  const dir = tempInstanceDir();
+
+  // Life before the restart: thread open for user 4601.
+  const storeA = openStore(dir);
+  const brainA = recorder(storeA).brain;
+  brainA.onEvent(taskEvent("t-rc", "restart-conv-user"));
+  brainA.onEvent({ v: 1, type: "thread_created", task_id: "t-rc", thread_id: "121212121" });
+  storeA.close();
+
+  // Fresh process: rehydrate, then the user replies IN THEIR THREAD.
+  const storeB = openStore(dir);
+  const { brain, effects } = recorder(storeB);
+  brain.onEvent(helloEvent());
+  brain.onEvent(taskEvent("t-rc-turn", "restart-conv-user", "121212121", "I'm all set — done"));
+
+  // Conversation, not the pointer: the turn surfaced readiness.
+  expect(threads(effects).length).toBe(0);
+  const reply = posts(effects).at(-1);
+  expect(reply?.task_id).toBe("t-rc-turn");
+  expect(reply?.text).toContain("flagged this for a person");
+  expect(reply?.text).not.toContain("already have a thread");
+
+  // ...and the ORIGINAL work_item parked at waiting_human.
+  const db = rawDb(dir);
+  const row = db.query("SELECT status FROM work_items WHERE id = 't-rc'").get() as { status: string };
+  expect(row.status).toBe("waiting_human");
   db.close();
   storeB.close();
 });
