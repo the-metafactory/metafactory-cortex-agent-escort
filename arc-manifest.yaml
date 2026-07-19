@@ -1,9 +1,12 @@
 # arc-manifest.yaml — metafactory-cortex-agent-escort
 #
-# THE CANONICAL SAMPLE of a DETERMINISTIC cortex agent bundle. Where
+# THE CANONICAL SAMPLE of a cortex agent bundle with a closed effect
+# universe — deterministic by default at the anonymous edge, stack-managed
+# hybrid voice by opt-in (compose, cortex#2257). Where
 # the-metafactory/example-agent is the minimal teaching chassis, this pack is a
-# complete, live-deployed agent with a real job (onboarding greeter) and a
-# closed effect universe — see README.md for the full positioning.
+# complete, live-deployed agent with a real job (onboarding greeter) — see
+# README.md for the full positioning and the trust-ring doctrine ("the more
+# anonymous the audience, the more deterministic the brain").
 #
 # `arc install metafactory-cortex-agent-escort` drops the agent fragment +
 # persona into the cortex host's agents.d/ + personas/ dirs, then runs the
@@ -11,11 +14,11 @@
 # See: https://github.com/the-metafactory/arc
 
 name: "metafactory-cortex-agent-escort"
-version: "0.4.0"
+version: "0.5.0"
 type: agent
 tier: community
 license: "MIT"
-description: "Escort — a deterministic cortex onboarding greeter. Answers a stranger's first mention on a bound public channel, opens a private thread, walks the newcomer through the door checklist, and surfaces readiness to a human. Surfaces, never grants — the canonical sample of a deterministic cortex agent bundle."
+description: "Escort — a cortex onboarding greeter with a closed effect universe. Answers a stranger's first mention on a bound public channel, opens a private thread, walks the newcomer through the door checklist, and surfaces readiness to a human. Deterministic by default at the anonymous edge, stack-managed hybrid voice by opt-in (compose, cortex#2257; no API key). Surfaces, never grants."
 authors:
   - "the-metafactory"
 repository: "the-metafactory/metafactory-cortex-agent-escort"

@@ -13,7 +13,7 @@
  */
 
 import { loadBrainEnv } from "./env";
-import { resolveIdentity } from "./config";
+import { resolveIdentity, resolveVoiceEnabled } from "./config";
 import { JsonlDecoder, parseEventLine } from "./protocol";
 import { EscortBrain, encodeEffectLine, type BrainEffect } from "./handler";
 import { openEscortStateFromEnv } from "./state";
@@ -22,6 +22,11 @@ import { openEscortStateFromEnv } from "./state";
 // overlay .env BEFORE resolving identity — see brain/env.ts + brain/config.ts.
 loadBrainEnv();
 const identity = resolveIdentity();
+// The hybrid voice switch — DEFAULT OFF: deterministic at the anonymous
+// edge. Both this AND the deployment's host-side `runtime.brain.compose:
+// true` must be on for the voice to speak; either off ⇒ the exact canned
+// lines (see brain/config.ts resolveVoiceEnabled).
+const voiceEnabled = resolveVoiceEnabled();
 
 // Durable session state — an agent-state instance at ESCORT_STATE_DIR
 // (default ~/.config/cortex/agents/escort), AUTHORITATIVE and read per event
@@ -42,7 +47,8 @@ if (socketPath === undefined || socketPath.length === 0 || token === undefined) 
 }
 
 process.stderr.write(
-  `escort: identity="${identity.displayName}" persona=${identity.personaSource} (${identity.personaPath})\n`,
+  `escort: identity="${identity.displayName}" persona=${identity.personaSource} ` +
+    `(${identity.personaPath}) voice=${voiceEnabled ? "on" : "off"}\n`,
 );
 
 // Outbound writer with backpressure: `socket.write` may accept only part of a
@@ -71,7 +77,12 @@ function send(effect: BrainEffect): void {
   flushOut();
 }
 
-const brain = new EscortBrain({ send, identity: { displayName: identity.displayName }, state });
+const brain = new EscortBrain({
+  send,
+  identity: { displayName: identity.displayName },
+  state,
+  voice: voiceEnabled,
+});
 const decoder = new JsonlDecoder();
 let shuttingDown = false;
 

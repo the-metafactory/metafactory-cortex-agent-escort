@@ -59,6 +59,30 @@ function resolvePersona(): { path: string; source: AgentIdentity["personaSource"
   return { path: packDefault, source: "none" };
 }
 
+/**
+ * The hybrid voice switch — whether the brain asks the host for
+ * substrate-rendered voice lines (`compose`, cortex#2257) where it posts.
+ * TWO opt-ins must both be on for the voice to actually speak:
+ *
+ *   1. THIS switch (`ESCORT_VOICE` — env or the principal overlay .env):
+ *      the brain-side gate. Off ⇒ no compose is ever emitted and the
+ *      effect stream is byte-identical to the deterministic brain.
+ *   2. The host-side `runtime.brain.compose: true` on the deployed agent
+ *      fragment (agent.yaml ships it OFF): without it every compose is
+ *      refused `cant_do` and the canned lines go out unchanged.
+ *
+ * DEFAULT OFF — deterministic at the anonymous edge (prompt-injection
+ * posture): the more anonymous the audience, the more deterministic the
+ * brain. Enable only for trusted-audience deployments. See agent.yaml's
+ * compose comment and README.md's hybrid section.
+ */
+export function resolveVoiceEnabled(): boolean {
+  const raw = process.env.ESCORT_VOICE;
+  if (raw === undefined) return false;
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "on";
+}
+
 /** Resolve the full principal-specific identity for this brain instance. */
 export function resolveIdentity(): AgentIdentity {
   const nameFromEnv = process.env.ESCORT_DISPLAY_NAME;

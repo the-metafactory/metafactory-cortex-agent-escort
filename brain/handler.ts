@@ -19,14 +19,23 @@
  *
  *   1. The ONLY effects this file ever emits are `post`, `post_log` (from
  *      `surface()` alone — the back-office notification, cortex#2256),
+ *      `compose` (from the voice seam alone, and only when the deployment
+ *      enables the voice — cortex#2257; disabled ⇒ never emitted and the
+ *      stream is byte-identical to the deterministic brain),
  *      `create_private_thread`, and the terminal `result`. There is no code
  *      path to `ask_principal`, and `create_private_thread` is only ever
  *      emitted with `members: "source"` — never anything derived from
  *      message text. `result` carries only canned summaries/reasons — never
  *      message text. `post_log` carries only canned copy + host-sourced ids
- *      (source user, host-resolved thread id) — never message text — and
- *      names no channel (the wire shape has no channel field; the host
- *      derives the target from the agent's own logChannelId binding).
+ *      (source user, host-resolved thread id) — never message text, never
+ *      composed text — and names no channel (the wire shape has no channel
+ *      field; the host derives the target from the agent's own logChannelId
+ *      binding). `compose` carries a canned intent literal + (as `context`)
+ *      the newcomer's message text length-capped — context is the ONE place
+ *      message text crosses the wire, and it can only ever become words in
+ *      a post body the shell already decided (brain/voice.ts rules 1–3);
+ *      composed text never feeds a state-machine decision, an effect's
+ *      structural field, a post_log, or a result.
  *   2. Every parameter of `create_private_thread` comes from the event
  *      SOURCE (`task.source.user`), never from `task.payload` or message
  *      text. Message/task text is read ONLY to decide which canned reply to
@@ -92,6 +101,7 @@ import type {
   ThreadCreatedEvent,
 } from "./protocol";
 import { EscortSessions, type EscortStateStore, type OpenOnboarding } from "./state";
+import { EscortVoice } from "./voice";
 
 export interface EscortIdentity {
   /** The principal-chosen display name (see brain/config.ts). */
@@ -103,6 +113,16 @@ export interface EscortDeps {
   send(effect: BrainEffect): void;
   /** Principal-resolved identity — the name greetings use. */
   identity: EscortIdentity;
+  /**
+   * The hybrid voice switch — `true` ⇒ where the shell posts, it MAY first
+   * ask the host for a substrate-rendered voice line (`compose`,
+   * cortex#2257) and place the answer into the post it already decided; any
+   * failure falls back to the exact canned line. `false`/absent (the
+   * DEFAULT — the deterministic posture at the anonymous edge, see
+   * agent.yaml + config.ts `resolveVoiceEnabled`) ⇒ the emitted effect
+   * stream is byte-identical to the pure deterministic brain.
+   */
+  voice?: boolean;
   /**
    * Durable session state — an agent-state instance opened by main.ts, or a
    * temp-dir store in tests. AUTHORITATIVE when present: read per event via
@@ -178,6 +198,36 @@ function buildThreeThingsCopy(displayName: string): string {
 }
 
 /**
+ * The voice-intent vocabulary — the SHELL'S short instructions for the
+ * host's substrate turn (`compose`, cortex#2257). These are the only intents
+ * this brain ever emits; each names exactly one canned-copy site whose words
+ * the model may warm. All are well under the host's 500-char intent cap.
+ * The persona (the doorkeeper — ../persona.md) is the system prompt of the
+ * turn, so the intents stay task-shaped and lean on it for character.
+ */
+const VOICE_INTENT_GREET =
+  "A newcomer has just arrived and you've opened a private onboarding thread " +
+  "for them. Greet them warmly in one or two short sentences — you're about " +
+  "to walk them through the entry steps, which are listed for them " +
+  "separately, so don't list any steps yourself.";
+
+const VOICE_INTENT_GUIDE =
+  "Answer this newcomer's message in one or two short sentences, warmly and " +
+  "in plain words, guiding them through the three entry things: a real full " +
+  "name as their display name, a profile picture, and four short intro " +
+  "questions answered in the thread. If they ask for something you can't do " +
+  "(roles, access, posting elsewhere), say plainly that a person handles " +
+  "that. Never promise or grant anything.";
+
+function voiceIntentFlagged(verdict: string): string {
+  return (
+    "You've just flagged a person to come welcome this newcomer. Tell them " +
+    "warmly in one or two short sentences that a real person will be along " +
+    `to say hi, and that the three things ${verdict}.`
+  );
+}
+
+/**
  * Discord snowflakes are decimal digit strings. A thread id read back from
  * the state DB has round-tripped through storage, so before it is ever
  * interpolated into post TEXT it must re-prove its shape — anything else
@@ -216,12 +266,25 @@ export class EscortBrain {
   private readonly pendingThreads = new Map<string, string>();
   /** DB-authoritative session reads/writes with the inverted fail-soft. */
   private readonly sessions: EscortSessions;
+  /**
+   * The voice seam (brain/voice.ts) — where a post the shell has ALREADY
+   * decided may get a substrate-rendered body. Disabled (the default) it is
+   * a straight pass-through: `deliver` sends the fallback post synchronously
+   * and emits no compose, keeping the effect stream byte-identical to the
+   * deterministic brain. Its pending map is the same transient
+   * in-flight-correlation class as `pendingThreads`.
+   */
+  private readonly voice: EscortVoice;
 
   constructor(deps: EscortDeps) {
     this.deps = deps;
     this.sessions = new EscortSessions(deps.state ?? null, (taskId) =>
       this.pendingThreads.has(taskId),
     );
+    this.voice = new EscortVoice({
+      send: (effect) => this.deps.send(effect),
+      enabled: deps.voice === true,
+    });
   }
 
   /**
@@ -255,15 +318,30 @@ export class EscortBrain {
       case "effect_rejected":
         this.onEffectRejected(event);
         return;
+      case "composed":
+        // The host's substrate-rendered voice line (cortex#2257) — the seam
+        // places it into the post the shell already decided (or ignores a
+        // stale/unknown compose_id). Model text lands ONLY there; nothing
+        // here parses or branches on it.
+        this.voice.onComposed(event);
+        return;
       case "cancel":
-        // Host abandoned the task — drop any in-flight correlation and close
-        // the work_item (waiting_human survives: the steward's queue entry
-        // outlives a task cancel — see state.ts recordClosed). No effect.
+        // Host abandoned the task — drop any in-flight correlation (thread
+        // AND voice) and close the work_item (waiting_human survives: the
+        // back-office queue entry outlives a task cancel — see state.ts
+        // recordClosed). No effect.
         this.pendingThreads.delete(event.task_id);
+        this.voice.onCancel(event.task_id);
         this.sessions.recordClosed(event.task_id, "cancelled", "host cancelled the task");
         return;
-      case "gate_verdict":
       case "shutdown":
+        // Drain: flush any pending voice turns as their canned fallbacks so
+        // no decided post is lost to a compose that will never answer
+        // (never mute). The escort never emits ask_principal, so nothing
+        // else is pending.
+        this.voice.flushAllAsFallback();
+        return;
+      case "gate_verdict":
         // The escort never emits ask_principal, so there is nothing pending
         // to resolve here. Tolerated, not acted on.
         return;
@@ -325,8 +403,14 @@ export class EscortBrain {
     // the host can route); state transitions record against the work_item's
     // own id.
     if (open !== null && open.threadId !== null && task.source.thread === open.threadId) {
-      this.converse(open, task.task_id, taskText(task));
-      this.completeTask(task.task_id, "in-thread onboarding turn handled");
+      // The terminal result rides the turn's own continuation: with the
+      // voice seam disabled it fires synchronously right after the post
+      // (byte-identical to the deterministic stream); with a compose in
+      // flight it fires only once the post (composed or fallback) is out —
+      // a result first would close the task and orphan the post.
+      this.converse(open, task.task_id, taskText(task), () =>
+        this.completeTask(task.task_id, "in-thread onboarding turn handled"),
+      );
       return;
     }
 
@@ -379,15 +463,32 @@ export class EscortBrain {
     this.pendingThreads.delete(event.task_id);
 
     this.sessions.recordThreadCreated(event.task_id, event.thread_id); // host-resolved, never message text
-    this.deps.send({
-      v: 1,
-      type: "post",
-      task_id: event.task_id,
-      text: `Hi — I'm ${this.deps.identity.displayName}. Welcome!\n\n${buildThreeThingsCopy(this.deps.identity.displayName)}`,
-    });
-    // The greeting is this task's final act — terminate it. The ONBOARDING
-    // stays open (the DB work_item); later turns arrive as new tasks.
-    this.completeTask(event.task_id, "opened an onboarding thread and posted the greeting");
+    // The greeting body: a deterministic scaffold (the canned three-things
+    // walk — the MECHANICS) with one prose slot the voice seam may fill.
+    // The fallback opening is the exact deterministic line; the walk itself
+    // NEVER composes — its content is procedure, not tone.
+    const displayName = this.deps.identity.displayName;
+    const greetingBody = (opening: string): string =>
+      `${opening}\n\n${buildThreeThingsCopy(displayName)}`;
+    this.voice.deliver(
+      {
+        post: {
+          v: 1,
+          type: "post",
+          task_id: event.task_id,
+          text: greetingBody(`Hi — I'm ${displayName}. Welcome!`),
+        },
+        place: greetingBody,
+        // The greeting is this task's final act — terminate it AFTER the
+        // post goes out (composed or fallback; the host pauses the task's
+        // liveness timer while the compose is in flight, the same pause
+        // that already covers the thread create). The ONBOARDING stays
+        // open (the DB work_item); later turns arrive as new tasks.
+        after: () =>
+          this.completeTask(event.task_id, "opened an onboarding thread and posted the greeting"),
+      },
+      VOICE_INTENT_GREET,
+    );
   }
 
   /**
@@ -416,6 +517,17 @@ export class EscortBrain {
     // the agent-state dashboard — the durable record — are already settled;
     // the back-office notification is a best-effort breadcrumb on top.
     if (event.effect === "post_log") return;
+    // cortex#2257 FALLBACK, the hybrid contract's hard rule: a rejected
+    // `compose` — whatever the reason (`cant_do` the deployment never
+    // enabled the host opt-in, `policy_denied` rate limit, `not_now`
+    // timeout/transient, `wont_do` caps) — means the EXACT canned post the
+    // shell already decided goes out now and the shell's continuation (the
+    // terminal result and, on the surfacing turn, the back-office post_log)
+    // runs. Never mute, never block an effect, never re-ask.
+    if (event.effect === "compose") {
+      this.voice.onComposeRejected(event.task_id);
+      return;
+    }
     if (event.effect !== "create_private_thread") return;
     if (!this.pendingThreads.has(event.task_id)) return;
 
@@ -456,31 +568,52 @@ export class EscortBrain {
    * not counted, matching the old semantics where the count was never read
    * after surfacing.
    */
-  private converse(open: OpenOnboarding, replyTaskId: string, text: string): void {
+  private converse(
+    open: OpenOnboarding,
+    replyTaskId: string,
+    text: string,
+    finish?: () => void,
+  ): void {
     if (open.phase === "surfaced") {
-      // Already flagged for a human — stay patient, don't nag, don't re-surface.
+      // Already flagged for a human — stay patient, don't nag, don't
+      // re-surface. Deliberately NOT voiced: the patience note is a stable
+      // promise ("I've already let a person know"), not conversational
+      // color — it must never drift.
       this.deps.send({
         v: 1,
         type: "post",
         task_id: replyTaskId,
         text: "I've already let a person know you're ready — they'll be along. Feel free to keep chatting while you wait.",
       });
+      finish?.();
       return;
     }
 
     const turns = this.sessions.bumpTurns(open.taskId);
 
     if (looksReady(text)) {
-      this.surface(open, replyTaskId, turns);
+      this.surface(open, replyTaskId, turns, text, finish);
       return;
     }
 
-    this.deps.send({
-      v: 1,
-      type: "post",
-      task_id: replyTaskId,
-      text: this.guidanceReply(text),
-    });
+    // The guidance reply — the one fully-voiced body: the canned keyword
+    // reply is the fallback; the voice seam may render the whole body from
+    // the newcomer's (untrusted, length-capped) message as context. The
+    // DECISION to reply, on which task, and the terminal result are the
+    // shell's, exactly as before.
+    this.voice.deliver(
+      {
+        post: {
+          v: 1,
+          type: "post",
+          task_id: replyTaskId,
+          text: this.guidanceReply(text),
+        },
+        after: finish,
+      },
+      VOICE_INTENT_GUIDE,
+      text,
+    );
   }
 
   /**
@@ -509,9 +642,17 @@ export class EscortBrain {
    * the agent-state work_item key (they differ whenever the readiness turn
    * is a later task, which under the real host it always is).
    */
-  private surface(open: OpenOnboarding, replyTaskId: string, turns: number): void {
+  private surface(
+    open: OpenOnboarding,
+    replyTaskId: string,
+    turns: number,
+    text: string,
+    finish?: () => void,
+  ): void {
     // The work_item parks at waiting_human and stays OPEN — a human resolves
     // it via agent-state's errands CLI after saying the welcome (README.md).
+    // The durable transition happens FIRST, before any voice turn: a crash
+    // mid-compose leaves the dashboard-visible state already correct.
     this.sessions.recordSurfaced(open.taskId);
     // engaged = they said something beyond the readiness word itself — a
     // soft, openly-caveated heuristic (see looksReady's doc comment above),
@@ -519,26 +660,42 @@ export class EscortBrain {
     // includes this readiness turn, so >1 means at least one earlier turn.
     const engaged = turns > 1;
     const verdict = engaged ? "look done" : "look not done yet — no other messages from them yet";
-    this.deps.send({
-      v: 1,
-      type: "post",
-      task_id: replyTaskId,
-      text: `Thanks, ${open.user} — I've flagged this for a person. The three things ${verdict}. They'll be along to say hi.`,
-    });
-    // The back-office notification. The thread pointer only when the
-    // host-resolved id re-proves its snowflake shape (it has round-tripped
-    // through the state DB — same rule as duplicateMentionCopy); otherwise
-    // the canned fallback.
+    // The back-office notification — composed NEVER (the hybrid hard line):
+    // post_log is a control-plane breadcrumb with the authoritative verdict;
+    // only canned copy + host-sourced ids ever reach it. Built here, sent in
+    // the continuation AFTER the in-thread note (stream order unchanged).
     const where =
       open.threadId !== null && SNOWFLAKE.test(open.threadId)
         ? `<#${open.threadId}>`
         : "their onboarding thread";
-    this.deps.send({
+    const backOfficeNote: BrainEffect = {
       v: 1,
       type: "post_log",
       task_id: replyTaskId,
       text: `${open.user} says they're ready in ${where} — the three things ${verdict}. A person should come say hi.`,
-    });
+    };
+    // The in-thread note: deterministic scaffold (the thanks) with a voiced
+    // prose slot; the fallback is the exact deterministic line. The VERDICT
+    // rides the intent (shell → model), but the composed words never feed
+    // back into it — the back-office note above carries the authoritative
+    // copy either way.
+    this.voice.deliver(
+      {
+        post: {
+          v: 1,
+          type: "post",
+          task_id: replyTaskId,
+          text: `Thanks, ${open.user} — I've flagged this for a person. The three things ${verdict}. They'll be along to say hi.`,
+        },
+        place: (voiceText) => `Thanks, ${open.user} — ${voiceText}`,
+        after: () => {
+          this.deps.send(backOfficeNote);
+          finish?.();
+        },
+      },
+      voiceIntentFlagged(verdict),
+      text,
+    );
   }
 
   /** Canned, keyword-triggered guidance — never a free-form model reply. */

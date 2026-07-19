@@ -1,6 +1,7 @@
 # metafactory-cortex-agent-escort
 
-**The canonical sample of a *deterministic* cortex agent bundle.** Escort is an
+**The canonical sample of a cortex agent bundle with a *closed effect
+universe* — deterministic by default, hybrid by opt-in.** Escort is an
 onboarding greeter with one job: when a stranger @-mentions it on a bound
 public channel, it opens them a private thread, walks them through the three
 things a person checks before letting them all the way in, answers questions,
@@ -10,9 +11,9 @@ never grants a role.
 Where [`example-agent`](https://github.com/the-metafactory/example-agent) is
 the **minimal teaching chassis** (greet/echo/gate, deliberately no real job),
 this pack is a complete, live-deployed agent built on that chassis — the shape
-to copy when you want a real deterministic agent, packaged and delivered the
-way meta-factory.ai delivers agents. See [Provenance](#provenance) for where
-it runs today.
+to copy when you want a real agent with a code-audited effect boundary,
+packaged and delivered the way meta-factory.ai delivers agents. See
+[Provenance](#provenance) for where it runs today.
 
 ---
 
@@ -23,16 +24,29 @@ ecosystem taxonomy names three classes:
 
 | Class | What answers | Sample |
 |---|---|---|
-| **deterministic** | pure rules — no model call anywhere; every reply is written by hand and every effect is code-audited | **this pack** |
+| **deterministic** | pure rules — no model call anywhere; every reply is written by hand and every effect is code-audited | **this pack, as shipped** (and pinned at [`v0.1.0`](https://github.com/the-metafactory/metafactory-cortex-agent-escort/tree/v0.1.0) as the pure deterministic reference) |
 | **LLM-hosted** | the host runs a model session as the brain (e.g. a claude-code substrate agent) | [example-non-deterministic](https://github.com/the-metafactory/metafactory-cortex-agent-example-non-deterministic) |
-| **hybrid** | an exec brain that *calls* a model for language but keeps effects in code | [example-hybrid](https://github.com/the-metafactory/metafactory-cortex-agent-example-hybrid) |
+| **hybrid** | a deterministic effect shell that borrows a model for its *words* only | **this pack, with the `compose` opt-in ON** — the STACK-MANAGED variant; [example-hybrid](https://github.com/the-metafactory/metafactory-cortex-agent-example-hybrid) demonstrates the self-contained SDK variant |
 
-Deterministic is the right class for an agent that faces **anonymous
-strangers**: there is no prompt to inject into, no tool loop to widen, and the
-complete behaviour fits in one reviewable file
-([`brain/handler.ts`](./brain/handler.ts)). The trade-off is equally plain —
-canned replies, keyword triggers, no free conversation. When you need
-language, you move to hybrid and keep the effect discipline below.
+Since v0.5.0 this pack supports **both postures from one opt-in**
+(`runtime.brain.compose` + `ESCORT_VOICE` — see
+[The hybrid voice](#the-hybrid-voice--the-compose-effect-cortex2257)), and the
+positioning rule is the **trust-ring doctrine**:
+
+> **The more anonymous the audience, the more deterministic the brain.**
+
+| Audience | Run it as | Why |
+|---|---|---|
+| the anonymous edge — open onboarding, strangers | **deterministic** (the opt-in OFF, the shipped default; `v0.1.0` is the pure reference) | no prompt to inject into, no model between untrusted text and the agent's mouth; the complete behaviour fits in one reviewable file ([`brain/handler.ts`](./brain/handler.ts)) |
+| trusted inner circles | **hybrid** (enable `compose`) | the model warms the words; the shell still decides every effect, and every failure falls back to the canned line |
+
+The trade-off of the deterministic posture is equally plain — canned replies,
+keyword triggers, no free conversation. The hybrid posture buys language
+without giving up the effect discipline below; the two variants differ only
+in WHERE the model runs: this pack asks the **stack's own substrate**
+(host-mediated, no API key anywhere in the pack), while
+[example-hybrid](https://github.com/the-metafactory/metafactory-cortex-agent-example-hybrid)
+holds its own SDK credential and calls the model itself.
 
 ## Terminology (cortex ubiquitous language)
 
@@ -51,15 +65,18 @@ name.
 ## The closed effect universe — "surfaces, never grants"
 
 The escort's boundary is the reason this repo exists as a sample. The brain
-can do exactly four things: open a private thread for the triggering
+can do exactly five things: open a private thread for the triggering
 stranger, post text into the conversation it is already in, drop one canned
 readiness note into its own bound back-office channel (`post_log` — see
-"Back-office notification" below), and terminate its own task with a
-`result`. It cannot grant a role, pick a channel to post into (`post` and
-`post_log` both carry no channel field — the host decides each target),
-ping a raw API, or ask the principal to approve something — **not because it
-is told not to, but because there is no effect in its wire protocol that does
-any of those things.**
+"Back-office notification" below), ask the host for a rendered voice line to
+place into a post it already decided (`compose` — opt-in, OFF by default;
+see "The hybrid voice" below), and terminate its own task with a `result`.
+It cannot grant a role, pick a channel to post into (`post` and `post_log`
+both carry no channel field — the host decides each target), choose a model
+or system prompt for its voice (`compose` carries neither — the host derives
+both from the agent's own manifest), ping a raw API, or ask the principal to
+approve something — **not because it is told not to, but because there is no
+effect in its wire protocol that does any of those things.**
 
 Three structural facts, each checked in code:
 
@@ -154,6 +171,8 @@ config.example.env  copy → ~/.config/metafactory/escort/.env (your overlay)
 brain/
   main.ts           daemon socket shell (auth → decode events ⇄ write effects)
   handler.ts        events → effects: the escort's actual behaviour
+  voice.ts          the hybrid voice seam (cortex#2257): compose/composed
+                     correlation, canned-fallback discipline, caps
   protocol.ts       minimal cortex-brain/v1 + create_private_thread (cortex#2206)
   state.ts          agent-state persistence — the DB-authoritative
                      read-through store, the memory-only degraded mode,
@@ -165,6 +184,10 @@ scripts/
   scaffold-state.sh         postinstall step 2 — instance state (optional, soft-skips)
 test/
   handler.test.ts   drives the brain, asserts the exact effect stream
+  voice.test.ts     the hybrid hard rules: byte-identical stream with voice
+                     off, canned fallback on every failure, model text only
+                     in decided post bodies, never in decisions, one result
+                     per task, agent.yaml keyless + compose off
   state.test.ts     persistence: transitions write rows, restart continuity,
                      external writes visible without restart,
                      duplicate-mention pointer, missing/dying-DB degradation
@@ -358,9 +381,9 @@ strict snowflake shape after its DB round-trip. Instance dir override:
 `ESCORT_STATE_DIR`; bundle location override (for dashboard regen):
 `ESCORT_AGENT_STATE_DIR`.
 
-The remaining planned follow-up is the **hybrid voice upgrade** (an optional
-model-shaped reply layer on top of the same closed effect universe, as a
-host-mediated substrate variant) — planned for v0.5.0 (v0.4.0 shipped the
+The **hybrid voice** shipped in v0.5.0 (see "The hybrid voice" above) —
+an optional model-rendered reply layer on the same closed effect universe,
+as the host-mediated substrate variant, off by default (v0.4.0 shipped the
 DB-authoritative read-through state layer; v0.3.0 the back-office
 notification).
 
@@ -375,8 +398,12 @@ beyond `post` / `post_log` / `create_private_thread` / the terminal `result`
 — checked across the full stream, not just the final state, with `result`
 summaries and `post_log` texts asserted to be canned literals and `post_log`
 reachable ONLY through the readiness path — and a hostile *first* mention
-must never leak message text into an effect's structural fields. **Treat any change
-that weakens these as a regression, not a refactor.**
+must never leak message text into an effect's structural fields. With the
+hybrid voice enabled the universe grows by exactly `compose`;
+[`test/voice.test.ts`](./test/voice.test.ts) pins that the voice-off stream
+stays byte-identical, that composed text can only ever become a post body,
+and that it never feeds a decision. **Treat any change that weakens these as
+a regression, not a refactor.**
 
 ## Back-office notification — the `post_log` effect (cortex#2256)
 
@@ -409,12 +436,76 @@ closed-universe trade-off's known limitation: cross-channel surfacing became
 possible exactly the right way — a new host-gated effect with a host-derived
 target — not by giving the brain a channel field.
 
+## The hybrid voice — the `compose` effect (cortex#2257)
+
+The same code speaks in two modes:
+
+- **Deterministic** (the DEFAULT, and the shipped posture): every reply is a
+  canned line from `brain/handler.ts`. The right mode at the **anonymous
+  edge** — an agent strangers can reach should not put a model between
+  untrusted text and its own mouth (prompt-injection posture). The
+  [`v0.1.0`](https://github.com/the-metafactory/metafactory-cortex-agent-escort/tree/v0.1.0)
+  tag remains the referenceable pure-deterministic version.
+- **Hybrid** (opt-in, per deployment — trusted audiences): where the shell
+  posts, it MAY first emit a `compose` effect and let the **stack's own
+  model substrate** render the words — cortex runs ONE tool-less substrate
+  turn with [`persona.md`](./persona.md) as the system prompt (the persona
+  file is load-bearing voice in this mode, not only documentation) and
+  places the answer into the post the shell already decided to send.
+
+**What composes** (three prose slots, each with a canned intent literal in
+`brain/handler.ts` — never message text as the instruction):
+
+1. the greeting's opening line (the canned checklist walk never composes —
+   mechanics are procedure, not tone),
+2. the guidance reply body (the newcomer's message rides along as
+   length-capped untrusted `context`),
+3. the "I've flagged a person" in-thread note's prose (the thanks scaffold
+   stays canned; the verdict rides the intent).
+
+**What NEVER composes:** the back-office `post_log` (the control-plane
+breadcrumb with the authoritative verdict), the duplicate-mention pointer
+and the post-surface patience note (stable promises/structural links),
+thread names, `result` summaries, and every non-`post` effect. Composed text
+lands ONLY in post bodies the shell already decided; it never feeds a
+state-machine decision (nothing parses it), and the effect universe grows by
+exactly `compose` — nothing else.
+
+**Fallback posture, hard rule:** any `effect_rejected` for a compose
+(`cant_do` opt-in off, `policy_denied` rate limit, `not_now`
+timeout/transient), an empty render, a host `cancel`, or a drain — the
+EXACT canned line goes out and the flow continues. Never mute, never a
+blocked effect, never a re-ask. With the voice off, the emitted effect
+stream is **byte-identical** to the deterministic brain (pinned in
+[`test/voice.test.ts`](./test/voice.test.ts)).
+
+**Why there is no API key:** `runtime.brain.secrets` stays `[]` — asserted
+by test. The voice comes from cortex working through the stack: the same
+centrally-managed claude-code substrate auth that serves LLM-hosted agents,
+host-mediated per turn (cheap model, tool-less, 30/hour/agent rate window,
+input/output caps — all enforced host-side; shipped in
+[cortex#2257](https://github.com/the-metafactory/cortex/issues/2257)). The
+self-contained SDK/API-key variant remains what
+[example-hybrid](https://github.com/the-metafactory/metafactory-cortex-agent-example-hybrid)
+demonstrates; this pack demonstrates the stack-managed variant.
+
+**Enabling it** (trusted-audience deployments only) takes BOTH switches:
+
+| Switch | Where | Ships as |
+|---|---|---|
+| `runtime.brain.compose: true` | the deployed agent fragment (`agent.yaml`) | `false` |
+| `ESCORT_VOICE=on` | the principal overlay `.env` (`brain/config.ts`) | unset (off) |
+
+Either one off ⇒ deterministic (the brain-side switch off emits no compose
+at all; the host-side switch off refuses each compose `cant_do` and the
+canned fallback goes out).
+
 ## Dev
 
 ```bash
 bun install
 bunx tsc --noEmit
-bun test          # 45 tests — the exact effect stream (hostile input included) + persistence
+bun test          # 59 tests — the exact effect stream (hostile input included), the hybrid hard rules, + persistence
 ```
 
 ## Provenance
@@ -429,7 +520,9 @@ sample** — the shape of the bundle, not the deployment itself. The
 `create_private_thread` effect it depends on shipped in
 [cortex#2206](https://github.com/the-metafactory/cortex/issues/2206), and the
 `post_log` effect behind the back-office notification shipped in
-[cortex#2256](https://github.com/the-metafactory/cortex/issues/2256). The
+[cortex#2256](https://github.com/the-metafactory/cortex/issues/2256), and
+the `compose` effect behind the hybrid voice shipped in
+[cortex#2257](https://github.com/the-metafactory/cortex/issues/2257). The
 chassis (socket shell, env/config overlay, protocol skeleton) comes from
 [`example-agent`](https://github.com/the-metafactory/example-agent).
 

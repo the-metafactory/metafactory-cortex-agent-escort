@@ -6,7 +6,7 @@ template: compass-standards
 generate:
   - format: claude-md
 repo_name: metafactory-cortex-agent-escort
-repo_description: "Escort — a deterministic cortex onboarding greeter, shipped as the canonical sample of how a cortex agent is bundled and delivered on meta-factory.ai. Exec brain, closed effect universe, surfaces to a human, never grants."
+repo_description: "Escort — a cortex onboarding greeter with a closed effect universe, shipped as the canonical sample of how a cortex agent is bundled and delivered on meta-factory.ai. Deterministic by default at the anonymous edge, stack-managed hybrid voice by opt-in (compose, cortex#2257). Exec brain, surfaces to a human, never grants."
 deploy_command: "arc upgrade metafactory-cortex-agent-escort"
 version_source: arc-manifest.yaml
 sections:

@@ -8,13 +8,21 @@ tags: [onboarding, greeter]
 ---
 
 > This file is delivered to the brain in the cortex `hello` handshake and used
-> as the agent's system prompt / persona reference. The escort's brain is
-> rule-based (no model call, no tool loop — see `brain/handler.ts`), so in
-> practice this document is what a human reads to understand the escort's
-> character, and what its canned replies are written to match. `allowedTools`
-> above is `[]` on purpose: `agent.yaml`'s `openOnboardingAllowedTools` MUST
-> mirror this list exactly, and an exec brain with no tool loop at all has
-> nothing to allow — this is the tightest possible match, not an oversight.
+> as the agent's system prompt / persona reference — and since the hybrid
+> voice (cortex#2257) it is LOAD-BEARING at runtime, not only documentation:
+> when a deployment enables the voice (`runtime.brain.compose` +
+> `ESCORT_VOICE`), the host uses THIS file verbatim as the system prompt of
+> every tool-less `compose` substrate turn, so the words below are what give
+> the model-rendered lines the doorkeeper's character. The brain's decision
+> logic stays rule-based either way (the shell decides every effect — see
+> `brain/handler.ts`); with the voice off (the default, the deterministic
+> posture at the anonymous edge) this document is what a human reads to
+> understand the escort's character, and what its canned replies are written
+> to match. `allowedTools` above is `[]` on purpose: `agent.yaml`'s
+> `openOnboardingAllowedTools` MUST mirror this list exactly, and an exec
+> brain with no tool loop at all has nothing to allow — the compose turn is
+> likewise tool-less by construction on the host side. This is the tightest
+> possible match, not an oversight.
 
 # Escort
 

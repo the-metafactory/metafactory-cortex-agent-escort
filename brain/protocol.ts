@@ -114,6 +114,27 @@ export interface ThreadCreatedEvent {
   thread_id: string;
 }
 
+/**
+ * `composed` — the answer to a `compose` effect (cortex#2257), correlated by
+ * `task_id` + `compose_id` (echoed verbatim from the effect). `text` is the
+ * substrate-rendered voice line, HOST-CAPPED at 2000 chars (overlong output
+ * is truncated host-side, never failed). There is no failure variant: a
+ * refused or failed `compose` comes back as the existing `effect_rejected`
+ * event instead (`cant_do` = substrate unavailable / the deployment never
+ * opted in via `runtime.brain.compose`; `policy_denied` = the host's
+ * 30/hour/agent rate limit; `wont_do` = an over-cap intent/context;
+ * `not_now` = timeout/transient substrate failure). Mirrors the shipped wire
+ * shape exactly (`the-metafactory/cortex` `src/brain/protocol.ts`,
+ * `ComposedEventSchema`).
+ */
+export interface ComposedEvent {
+  v: 1;
+  type: "composed";
+  task_id: string;
+  compose_id: string;
+  text: string;
+}
+
 export type BrainEvent =
   | TaskEvent
   | GateVerdictEvent
@@ -122,7 +143,8 @@ export type BrainEvent =
   | EffectRejectedEvent
   | HelloEvent
   | MessageEvent
-  | ThreadCreatedEvent;
+  | ThreadCreatedEvent
+  | ComposedEvent;
 
 const KNOWN_EVENT_TYPES = new Set([
   "task",
@@ -133,6 +155,7 @@ const KNOWN_EVENT_TYPES = new Set([
   "hello",
   "message",
   "thread_created",
+  "composed",
 ]);
 
 /**
@@ -248,9 +271,46 @@ export interface PostLogEffect {
   text: string;
 }
 
+/**
+ * `compose` — ask the host to render prose through the STACK'S OWN model
+ * substrate (cortex#2257): cortex runs ONE tool-less substrate turn — the
+ * agent's own persona file as the system prompt, `intent` (+ optional
+ * `context`) as the user turn — and answers with a `composed` event
+ * correlated by `compose_id`. Mirrors the shipped wire shape exactly
+ * (`the-metafactory/cortex` `src/brain/protocol.ts`, `ComposeEffectSchema`):
+ * `{ v, type, task_id, compose_id, intent, context? }` — deliberately NO
+ * model field, NO persona/system-prompt field, NO routing of any kind (the
+ * third consumer of cortex#2206's host-derived-everything pattern; the host
+ * derives persona from the agent's own manifest binding and the model from
+ * its `runtime.modelClass` ceiling, cheap end by default). A smuggled extra
+ * field would be silently stripped by cortex's tolerant-ingest codec.
+ *
+ * Host gates (all failures via the existing `effect_rejected`, never a
+ * bespoke shape): opt-in `runtime.brain.compose: true` (absent ⇒ `cant_do`),
+ * 30/hour/agent rate limit (`policy_denied`), intent ≤500 / context ≤4000
+ * chars (`wont_do`), timeout/transient ⇒ `not_now`. Daemon lifecycle only.
+ *
+ * This pack's own usage (brain/voice.ts) stays narrower than the wire
+ * permits: one compose in flight per task, context capped brain-side at
+ * `VOICE_MAX_CONTEXT_CHARS`, and the composed text lands ONLY in a post
+ * body the shell already decided to send.
+ */
+export interface ComposeEffect {
+  v: 1;
+  type: "compose";
+  task_id: string;
+  /** Brain-chosen correlation id, echoed verbatim on the `composed` answer. */
+  compose_id: string;
+  /** The shell's short instruction for the voice turn (host cap: 500 chars). */
+  intent: string;
+  /** Optional recent-turn text (untrusted; host cap: 4000 chars). */
+  context?: string;
+}
+
 export type BrainEffect =
   | PostEffect
   | PostLogEffect
+  | ComposeEffect
   | AskPrincipalEffect
   | ResultEffect
   | LogEffect

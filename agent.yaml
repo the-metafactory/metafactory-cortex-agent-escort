@@ -40,9 +40,20 @@ runtime:
     run: "bun {pack}/brain/main.ts"
     protocol: cortex-brain/v1
     lifecycle: daemon        # long-lived: connect once, serve events
-    secrets: []              # this brain reads no secrets of its own
+    secrets: []              # this brain reads no secrets of its own — the
+                             # hybrid voice (compose, below) runs through the
+                             # STACK'S substrate auth, never an API key here
     dispatch_capabilities: []
     maxRestarts: 3
+    # Hybrid voice opt-in (cortex#2257): `true` lets this brain's `compose`
+    # effects reach the stack's model substrate (one tool-less turn, the
+    # persona file as system prompt). Deterministic by default at the
+    # anonymous edge (prompt-injection posture); enable only for
+    # trusted-audience deployments. The pack CARRIES the hybrid capability;
+    # the DEPLOYMENT decides whether to enable it — flip this together with
+    # the brain-side ESCORT_VOICE switch (brain/config.ts). With it off,
+    # every compose is refused cant_do and the exact canned lines go out.
+    compose: false
 
 # Durable per-instance state — declares that this agent runs on an
 # agent-state instance (the `state` field of the agent-platform manifest
