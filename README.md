@@ -116,6 +116,8 @@ brain/
   main.ts           daemon socket shell (auth → decode events ⇄ write effects)
   handler.ts        events → effects: the escort's actual behaviour
   protocol.ts       minimal cortex-brain/v1 + create_private_thread (cortex#2206)
+  state.ts          agent-state persistence — fail-soft work_items/events
+                     store + dashboard regen (see "State" below)
   config.ts         resolves the principal's chosen name + persona
   env.ts            loads the principal's overlay .env
 scripts/
@@ -123,6 +125,8 @@ scripts/
   scaffold-state.sh         postinstall step 2 — instance state (optional, soft-skips)
 test/
   handler.test.ts   drives the brain, asserts the exact effect stream
+  state.test.ts     persistence: transitions write rows, restart rehydration,
+                     duplicate-mention pointer, missing-DB degradation
 ```
 
 Note what is *absent*, on purpose: no `issue-nats-creds.sh`. The escort runs
@@ -235,9 +239,55 @@ lays down a per-instance home:
 ```
 
 The step **soft-skips** if the bundle isn't installed — the pack installs
-cleanly either way. Agent-state persistence for the escort — what it records
-there (sessions opened, hand-offs surfaced) — and a hybrid voice upgrade are
-planned follow-ups.
+cleanly either way.
+
+**What the escort records there** ([`brain/state.ts`](./brain/state.ts)): each
+newcomer's onboarding is one `work_item` of kind `onboarding` (id = the
+task_id that opened it), its status mirroring the session phase within
+agent-state's constrained vocabulary:
+
+| Session phase | work_item status | Meaning |
+|---|---|---|
+| `thread_requested` | `pending` | thread asked for, `thread_created` not yet back |
+| `in_thread` | `in_flight` | private thread open, walk-through underway |
+| `surfaced` | `waiting_human` | newcomer says they're ready — a HUMAN takes it from here |
+
+Every transition appends an `event` (append-only audit trail), and
+`dashboard.md` is best-effort regenerated after each change via agent-state's
+own `RegenerateDashboard` workflow — a live back-office view of who's in a
+thread and who's waiting for a welcome. No message text is ever stored: the
+only persisted values are host-provided ids (task/user/thread), each
+length-capped and kept inside JSON columns, so nothing user-authored can reach
+the dashboard.
+
+**On boot** (the host's `hello` event) the brain rehydrates open items:
+`in_flight`/`waiting_human` rows become live sessions again, so a returning
+user's next mention gets a polite pointer to their existing thread instead of
+a second thread (or silence). Orphaned `pending` rows — a restart ate their
+`thread_created` ack — are resolved `failed`; that user's next mention simply
+retries fresh.
+
+**Resolving a surfaced item.** A `surfaced` work_item stays open at
+`waiting_human` — the escort never closes it. After saying the welcome,
+resolve it with agent-state's errands CLI:
+
+```bash
+MF_INSTANCE_DIR=~/.config/cortex/agents/escort \
+  bun <agent-state>/skill/scripts/errands.ts resolve --id <task-id> --status done
+```
+
+**Fail-soft posture (load-bearing).** State is memory, not authority. A
+missing, corrupt, or unwritable DB logs to stderr and the brain runs
+memory-only with an identical effect stream; boot never fails on state. The
+state layer widens nothing: the effect universe is unchanged, `brain/state.ts`
+has no access to `send`, and the only stored value that ever reaches post text
+is the host-resolved thread id, re-validated against a strict snowflake shape
+after its DB round-trip. Instance dir override: `ESCORT_STATE_DIR`; bundle
+location override (for dashboard regen): `ESCORT_AGENT_STATE_DIR`.
+
+The remaining planned follow-up is the **hybrid voice upgrade** (an optional
+model-shaped reply layer on top of the same closed effect universe) — slated
+for v0.3.0.
 
 ## The load-bearing test
 
@@ -268,7 +318,7 @@ protocol change.
 ```bash
 bun install
 bunx tsc --noEmit
-bun test          # 15 tests — the exact effect stream, hostile input included
+bun test          # 26 tests — the exact effect stream (hostile input included) + persistence
 ```
 
 ## Provenance

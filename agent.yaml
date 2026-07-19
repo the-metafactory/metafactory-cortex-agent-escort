@@ -44,6 +44,18 @@ runtime:
     dispatch_capabilities: []
     maxRestarts: 3
 
+# Durable per-instance state — declares that this agent runs on an
+# agent-state instance (the `state` field of the agent-platform manifest
+# shape that github.com/the-metafactory/agent-state exists to satisfy; same
+# declaration as arc-manifest.yaml, which hosts' state tooling keys on). The
+# instance dir is ~/.config/cortex/agents/escort/ (host=cortex convention),
+# scaffolded at install by scripts/scaffold-state.sh and overridable via
+# ESCORT_STATE_DIR (see brain/state.ts). Fail-soft: no instance, no
+# agent-state bundle, or a broken DB → the escort runs memory-only.
+state:
+  blueprint: agent-state
+  version: ">=0.1.0"
+
 # open-onboarding gate (mirrored from Pier, agents.d/pier.yaml:35-44): an
 # unmapped stranger's first mention on the bound public channel
 # gets a ZERO-AUTHORITY anon principal so the escort can answer at all,

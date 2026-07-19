@@ -26,6 +26,14 @@
  *      text. Message/task text is read ONLY to decide which canned reply to
  *      send — it is never interpolated into an effect's structural fields.
  *
+ * The state layer (brain/state.ts) changes NONE of this: it is memory, not
+ * authority — a local SQLite the brain writes session phases to and reads
+ * back on boot. It can never emit an effect (it has no `send`), and the only
+ * stored value that ever reaches post TEXT is the host-resolved thread id,
+ * re-validated against a strict snowflake shape after its DB round-trip (see
+ * duplicateMentionCopy). Fail-soft: state absent/corrupt → identical
+ * memory-only behaviour, never a boot failure.
+ *
  * "Structurally impossible to post outside the bound channel + its own
  * thread" is enforced by the protocol itself, not by this file's care:
  * `PostEffect` (protocol.ts) carries no channel/thread field at all — only
@@ -42,6 +50,7 @@ import type {
   TaskEvent,
   ThreadCreatedEvent,
 } from "./protocol";
+import type { EscortStateStore } from "./state";
 
 export interface EscortIdentity {
   /** The principal-chosen display name (see brain/config.ts). */
@@ -53,6 +62,14 @@ export interface EscortDeps {
   send(effect: BrainEffect): void;
   /** Principal-resolved identity — the name greetings use. */
   identity: EscortIdentity;
+  /**
+   * Durable session memory — an agent-state instance opened by main.ts, or a
+   * temp-dir store in tests. OPTIONAL and fail-soft: absent or `null` (DB
+   * missing/corrupt/unwritable) the brain runs exactly as before —
+   * memory-only, identical effect stream. State is memory, not authority: no
+   * code path below consults it to WIDEN an effect, only to remember sessions.
+   */
+  state?: EscortStateStore | null;
 }
 
 /** Session state for one stranger's visit, keyed by the task_id that started it. */
@@ -63,6 +80,12 @@ interface Session {
   user: string;
   /** Count of in-thread messages received (readiness heuristic — see below). */
   messageCount: number;
+  /**
+   * Host-resolved thread id (from `thread_created`, or rehydrated from state).
+   * Host-sourced ONLY — never message text. Used solely to point a returning
+   * user at their existing thread; see duplicateMentionCopy below.
+   */
+  threadId: string | null;
 }
 
 const READINESS_WORDS = ["done", "ready", "finished", "all set", "that's it", "thats it", "good to go"];
@@ -117,6 +140,32 @@ function buildThreeThingsCopy(displayName: string): string {
   ].join("\n");
 }
 
+/**
+ * Discord snowflakes are decimal digit strings. A rehydrated thread id has
+ * round-tripped through the state DB, so before it is ever interpolated into
+ * post TEXT it must re-prove its shape — anything else falls back to the
+ * generic pointer copy. (Effect STRUCTURAL fields never carry it at all.)
+ */
+const SNOWFLAKE = /^\d{1,32}$/;
+
+/**
+ * The polite duplicate-mention reply — replaces the old silent-ignore, which
+ * left a user who DID have a live session unable to tell "already have a
+ * thread" from "broken". Still a canned reply: the only dynamic part is the
+ * host-sourced thread id, and only when it looks like a real snowflake
+ * (`<#id>` renders as a thread link in Discord).
+ */
+function duplicateMentionCopy(session: Session): string {
+  if (session.phase === "thread_requested") {
+    return "I'm already opening a thread for you — it'll appear in this channel's thread list in just a moment.";
+  }
+  const where =
+    session.threadId !== null && SNOWFLAKE.test(session.threadId)
+      ? `<#${session.threadId}>`
+      : "look for it in this channel's thread list";
+  return `We already have a thread going — ${where}. Pick it up there whenever you're ready.`;
+}
+
 export class EscortBrain {
   private readonly deps: EscortDeps;
   private readonly sessions = new Map<string, Session>();
@@ -124,6 +173,11 @@ export class EscortBrain {
 
   constructor(deps: EscortDeps) {
     this.deps = deps;
+  }
+
+  /** Durable store or null — deps.state may be absent entirely. */
+  private get state(): EscortStateStore | null {
+    return this.deps.state ?? null;
   }
 
   /**
@@ -139,9 +193,11 @@ export class EscortBrain {
   onEvent(event: BrainEvent): void {
     switch (event.type) {
       case "hello":
-        // No log side-channel for anything user-triggered; a startup hello is
-        // host-generated, not stranger-influenced, so a log here is fine —
-        // but we don't even need it. Intentionally a no-op.
+        // Host-generated boot signal → rehydrate open onboarding sessions
+        // from the state DB so restarts stop forgetting who already has a
+        // thread. NO effect is ever emitted here — rehydration is pure
+        // memory rebuild; the store logs to stderr on its own.
+        this.rehydrate();
         return;
       case "task":
         this.onTask(event);
@@ -158,6 +214,7 @@ export class EscortBrain {
       case "cancel":
         // Host abandoned the task — drop any session tied to it. No effect.
         this.sessions.delete(event.task_id);
+        this.state?.recordClosed(event.task_id, "cancelled", "host cancelled the task");
         return;
       case "gate_verdict":
       case "shutdown":
@@ -167,19 +224,59 @@ export class EscortBrain {
     }
   }
 
+  /**
+   * Rebuild session memory from open `onboarding` work_items. Rehydrated
+   * sessions carry their ORIGINAL task_ids — those tasks are dead host-side
+   * after a restart, so no post can ever be routed to them by a fresh event.
+   * What a rehydrated session is FOR is the duplicate-mention path in onTask
+   * below: a returning user's NEW mention (new task_id) finds the live
+   * session via activeTaskByUser and gets the polite pointer post on the NEW
+   * task — never a second `create_private_thread`. The session's user id +
+   * thread id + phase are exactly what that reply needs.
+   */
+  private rehydrate(): void {
+    const state = this.state;
+    if (state === null) return;
+    for (const open of state.loadOpenOnboarding()) {
+      if (this.sessions.has(open.taskId)) continue; // never clobber live memory
+      this.sessions.set(open.taskId, {
+        phase: open.phase,
+        user: open.user,
+        messageCount: 0,
+        threadId: open.threadId,
+      });
+      this.activeTaskByUser.set(open.user, open.taskId);
+    }
+  }
+
   /** A mention lands on the bound channel — a stranger's first hello. */
   private onTask(task: TaskEvent): void {
     const user = task.source.user;
     if (user.trim().length === 0) return; // nothing to open a thread for
 
     // Idempotency: don't open a second thread for a user who already has one
-    // in flight or open. Ignore the duplicate mention entirely (no effect) —
-    // this is a defensive guard, not something the tests require.
+    // in flight or open — including a session rehydrated from state after a
+    // restart. The duplicate mention gets a polite pointer post (on the NEW
+    // task_id — the only one the host can route) instead of the old silent
+    // ignore, so "already have a thread" is distinguishable from "broken".
+    // Still no second create_private_thread, ever.
     const existingTaskId = this.activeTaskByUser.get(user);
-    if (existingTaskId !== undefined && this.sessions.has(existingTaskId)) return;
+    if (existingTaskId !== undefined) {
+      const existing = this.sessions.get(existingTaskId);
+      if (existing !== undefined) {
+        this.deps.send({
+          v: 1,
+          type: "post",
+          task_id: task.task_id,
+          text: duplicateMentionCopy(existing),
+        });
+        return;
+      }
+    }
 
-    this.sessions.set(task.task_id, { phase: "thread_requested", user, messageCount: 0 });
+    this.sessions.set(task.task_id, { phase: "thread_requested", user, messageCount: 0, threadId: null });
     this.activeTaskByUser.set(user, task.task_id);
+    this.state?.recordThreadRequested(task.task_id, user);
 
     // members: "source" is the ONLY literal this pack ever emits — see
     // protocol.ts CreatePrivateThreadEffect and the file header above. The
@@ -201,6 +298,8 @@ export class EscortBrain {
     if (session === undefined || session.phase !== "thread_requested") return;
 
     session.phase = "in_thread";
+    session.threadId = event.thread_id; // host-resolved, never message text
+    this.state?.recordThreadCreated(event.task_id, event.thread_id);
     this.deps.send({
       v: 1,
       type: "post",
@@ -227,6 +326,7 @@ export class EscortBrain {
     if (this.activeTaskByUser.get(session.user) === event.task_id) {
       this.activeTaskByUser.delete(session.user);
     }
+    this.state?.recordClosed(event.task_id, "failed", "create_private_thread rejected by host");
   }
 
   /** A follow-up message inside the opened thread. */
@@ -269,6 +369,9 @@ export class EscortBrain {
    */
   private surface(session: Session, taskId: string): void {
     session.phase = "surfaced";
+    // The work_item parks at waiting_human and stays OPEN — a human resolves
+    // it via agent-state's errands CLI after saying the welcome (README.md).
+    this.state?.recordSurfaced(taskId);
     // engaged = they said something beyond the readiness word itself — a
     // soft, openly-caveated heuristic (see looksReady's doc comment above),
     // never a claim this brain actually verified the three things.

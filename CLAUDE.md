@@ -35,8 +35,8 @@ When `CONTEXT.md` and your instinct disagree, `CONTEXT.md` wins. When a term cro
 
 - `agent.yaml` — the cortex fragment (installed to `agents.d/escort.yaml`; paths written for the INSTALLED location — `persona: ../personas/escort.md`).
 - `persona.md` — the doorkeeper character; its `allowedTools: []` MUST mirror `agent.yaml`'s `openOnboardingAllowedTools` exactly.
-- `brain/` — cortex-brain/v1 exec brain: `main.ts` (socket shell), `handler.ts` (all behaviour), `protocol.ts` (wire types incl. `create_private_thread`, cortex#2206), `config.ts` + `env.ts` (principal-overlay identity resolution).
-- `test/handler.test.ts` — 15 tests asserting the exact effect stream.
+- `brain/` — cortex-brain/v1 exec brain: `main.ts` (socket shell), `handler.ts` (all behaviour), `protocol.ts` (wire types incl. `create_private_thread`, cortex#2206), `state.ts` (fail-soft agent-state persistence), `config.ts` + `env.ts` (principal-overlay identity resolution).
+- `test/handler.test.ts` — 15 tests asserting the exact effect stream; `test/state.test.ts` — 11 persistence tests (rehydration, duplicate-mention pointer, fail-soft degradation).
 - `scripts/` — lifecycle postinstall (reload; state scaffold with soft-skip). Deliberately NO nats-creds script: the escort is in-process, not bus-sovereign.
 
 ## Gate
@@ -74,7 +74,7 @@ bun install && bunx tsc --noEmit && bun test
 ### Repo-specific critical rules
 
 - **The effect-stream security tests are sacred.** `test/handler.test.ts`'s two `CRITICAL` tests (hostile input never widens the effect universe; message text never reaches effect structural fields) define this pack. Any change that weakens their assertions is a regression, not a refactor — do not merge it.
-- **This repo is PUBLIC.** No live Discord snowflakes, tokens, or guild-specific identifiers anywhere — `agent.yaml` carries `__ESCORT_*__` placeholders only, and test fixtures use non-numeric placeholder ids. Keep them that way.
+- **This repo is PUBLIC.** No live Discord snowflakes, tokens, or guild-specific identifiers anywhere — `agent.yaml` carries `__ESCORT_*__` placeholders only, and test fixtures use non-numeric placeholder ids (the one exception: deliberately short fake numeric thread ids in `test/state.test.ts`, 9–12 digits where a real snowflake is 17+, because the snowflake-shape validation is itself under test). Keep them that way.
 - **Do not rewrite ported behaviour.** The pack is extracted from a live private-guild deployment, which remains the deployment source of truth; behavioural drift between the two is a coordinated change, not a drive-by edit.
 
 <!-- inject:after:critical-rules -->

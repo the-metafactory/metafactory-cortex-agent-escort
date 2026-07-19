@@ -16,11 +16,18 @@ import { loadBrainEnv } from "./env";
 import { resolveIdentity } from "./config";
 import { JsonlDecoder, parseEventLine } from "./protocol";
 import { EscortBrain, encodeEffectLine, type BrainEffect } from "./handler";
+import { openEscortStateFromEnv } from "./state";
 
 // Fill the principal's chosen knobs (display name, persona path, …) from their
 // overlay .env BEFORE resolving identity — see brain/env.ts + brain/config.ts.
 loadBrainEnv();
 const identity = resolveIdentity();
+
+// Durable session memory — an agent-state instance at ESCORT_STATE_DIR
+// (default ~/.config/cortex/agents/escort). FAIL-SOFT by contract: any state
+// problem returns null (state.ts logs to stderr) and the brain runs
+// memory-only, exactly as a stateless install. Boot never fails on state.
+const state = openEscortStateFromEnv();
 
 const socketPath = process.env.CORTEX_BRAIN_SOCKET;
 const token = process.env.CORTEX_BRAIN_SOCKET_TOKEN;
@@ -62,7 +69,7 @@ function send(effect: BrainEffect): void {
   flushOut();
 }
 
-const brain = new EscortBrain({ send, identity: { displayName: identity.displayName } });
+const brain = new EscortBrain({ send, identity: { displayName: identity.displayName }, state });
 const decoder = new JsonlDecoder();
 let shuttingDown = false;
 

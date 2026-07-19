@@ -11,7 +11,7 @@
 # See: https://github.com/the-metafactory/arc
 
 name: "metafactory-cortex-agent-escort"
-version: "0.1.0"
+version: "0.2.0"
 type: agent
 tier: community
 license: "MIT"
@@ -34,8 +34,10 @@ targets:
 # agent-state bundle (github.com/the-metafactory/agent-state) scaffolds a
 # per-instance home at ~/.config/cortex/agents/escort/ with a work queue
 # (work_items), an append-only diary (events), a dashboard, and weekly retros.
-# Agent-state persistence for the escort — what it records there (sessions
-# opened, hand-offs surfaced) — is a planned follow-up.
+# The escort USES this instance (brain/state.ts): each newcomer's onboarding
+# is a work_item (kind `onboarding`) whose status mirrors the session phase,
+# every transition appends an event, and dashboard.md regenerates per change.
+# Fail-soft: without the bundle or instance dir the escort runs memory-only.
 # Field shape per forge/design/agent-platform.md §state.
 state:
   blueprint: agent-state
