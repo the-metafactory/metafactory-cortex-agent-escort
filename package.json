@@ -1,0 +1,17 @@
+{
+  "name": "metafactory-cortex-agent-escort",
+  "version": "0.1.0",
+  "description": "Escort — deterministic cortex onboarding greeter. Exec brain, surfaces to a human, never grants.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "repository": "github:the-metafactory/metafactory-cortex-agent-escort",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.5.0"
+  }
+}

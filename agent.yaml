@@ -1,0 +1,80 @@
+# escort — the agent.yaml fragment this pack installs.
+#
+# arc drops it at {configRoot}/agents.d/escort.yaml (id-keyed filename, taken
+# from the `id:` below) and the persona at {configRoot}/personas/escort.md —
+# so every path in this file is written for the INSTALLED location, not the
+# pack checkout. Extracted from a live private-guild deployment, where the
+# pack remains in service (see README.md Provenance).
+#
+# The escort greets a stranger's first mention on its bound entry channel,
+# opens them a private thread, and walks them through the three things a
+# person checks before letting them all the way in. It never welcomes
+# anyone itself and never grants a role — see persona.md's "you surface; a
+# human grants".
+#
+# Chassis lineage: copied from the-metafactory/example-agent
+# (runtime.mode: in-process, brain.kind: exec — its own process, no tools,
+# no Bash, no LLM tool-loop, structurally, not by configuration). Presence
+# shape, the openOnboarding gate, and the placeholder-secret discipline
+# follow cortex's Pier (personas/pier.md, agents.d/pier.yaml) — same shape of
+# public, anon-reachable greeter, same guild-side wiring pattern.
+
+id: escort
+displayName: "Escort"
+
+# Persona path — resolved by cortex's loader RELATIVE TO THE FRAGMENT'S
+# DIRECTORY. arc installs the fragment at agents.d/escort.yaml and the persona
+# at personas/escort.md, so from agents.d/ the persona is
+# ../personas/escort.md. The fragment is installed verbatim — arc does NOT
+# rewrite this path — so it must be valid at the installed location.
+persona: ../personas/escort.md
+trust: []
+
+runtime:
+  mode: in-process
+  capabilities:
+    - escort.greet          # answers a stranger's first mention on the entry channel
+  modelClass: frontier
+  brain:
+    kind: exec
+    run: "bun {pack}/brain/main.ts"
+    protocol: cortex-brain/v1
+    lifecycle: daemon        # long-lived: connect once, serve events
+    secrets: []              # this brain reads no secrets of its own
+    dispatch_capabilities: []
+    maxRestarts: 3
+
+# open-onboarding gate (mirrored from Pier, agents.d/pier.yaml:35-44): an
+# unmapped stranger's first mention on the bound public channel
+# gets a ZERO-AUTHORITY anon principal so the escort can answer at all,
+# instead of the default "I'm not set up to respond to you" deny. The gate
+# fires only for a non-DM message on the escort's bound channel; an unmapped
+# DM stays denied.
+openOnboarding: true
+
+# Explicit tool ALLOWLIST for the anonymous onboarding session. MUST mirror
+# persona.md's declared `allowedTools` exactly (nothing enforces this match —
+# see persona.md's frontmatter, double-checked by hand at commit time). This
+# exec brain has no tool loop at all — the entire effect universe is
+# post / ask_principal / result / log / create_private_thread (brain/protocol.ts)
+# and none of those are "tools" in the allowlisted sense. Empty on both sides
+# is deliberate: an anon-reachable session has nothing here to widen.
+openOnboardingAllowedTools: []
+
+# Discord presence — placeholders ONLY. Every identifier below resolves at
+# cortex config-load from the daemon environment (compass#84 / L2), same
+# discipline as Pier's agents.d/pier.yaml:76-85. No live token or snowflake
+# is ever stored in this file. An unset value fails SOFT: the Discord surface
+# is disabled and the rest of the stack still boots — that is cortex's own
+# placeholder-resolution behaviour (same as Pier's), not code in this pack;
+# see README.md.
+presence:
+  discord:
+    enabled: true
+    token: __ESCORT_BOT_TOKEN__                     # resolved at cortex load
+    guildId: __ESCORT_GUILD_ID__                    # resolve-at-install
+    agentChannelId: __ESCORT_AGENT_CHANNEL_ID__      # the public entry channel
+    logChannelId: __ESCORT_LOG_CHANNEL_ID__          # private back-office (see README.md)
+    dmOwner: false                                   # the escort never claims DMs
+    contextDepth: 10
+    surfaceSubjects: []                              # no raw envelope surface

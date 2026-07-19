@@ -1,0 +1,55 @@
+# arc-manifest.yaml — metafactory-cortex-agent-escort
+#
+# THE CANONICAL SAMPLE of a DETERMINISTIC cortex agent bundle. Where
+# the-metafactory/example-agent is the minimal teaching chassis, this pack is a
+# complete, live-deployed agent with a real job (onboarding greeter) and a
+# closed effect universe — see README.md for the full positioning.
+#
+# `arc install metafactory-cortex-agent-escort` drops the agent fragment +
+# persona into the cortex host's agents.d/ + personas/ dirs, then runs the
+# lifecycle postinstall scripts below.
+# See: https://github.com/the-metafactory/arc
+
+name: "metafactory-cortex-agent-escort"
+version: "0.1.0"
+type: agent
+tier: community
+license: "MIT"
+description: "Escort — a deterministic cortex onboarding greeter. Answers a stranger's first mention on a bound public channel, opens a private thread, walks the newcomer through the door checklist, and surfaces readiness to a human. Surfaces, never grants — the canonical sample of a deterministic cortex agent bundle."
+authors:
+  - "the-metafactory"
+repository: "the-metafactory/metafactory-cortex-agent-escort"
+
+targets:
+  - cortex
+
+# Brain secrets: NONE — the escort's brain reads no secrets of its own
+# (agent.yaml runtime.brain.secrets: []). The Discord presence identifiers
+# (__ESCORT_*__ placeholders in agent.yaml) resolve at cortex config-load from
+# the daemon environment; they are stack-side, never this pack's.
+
+# Instance state (OPTIONAL) — the memory module.
+#
+# Declaring this block opts the escort into the metafactory memory module: the
+# agent-state bundle (github.com/the-metafactory/agent-state) scaffolds a
+# per-instance home at ~/.config/cortex/agents/escort/ with a work queue
+# (work_items), an append-only diary (events), a dashboard, and weekly retros.
+# Agent-state persistence for the escort — what it records there (sessions
+# opened, hand-offs surfaced) — is a planned follow-up.
+# Field shape per forge/design/agent-platform.md §state.
+state:
+  blueprint: agent-state
+  version: ">=0.1.0"
+
+lifecycle:
+  postinstall:
+    # Step 1 — the running cortex daemon learns the freshly dropped fragment.
+    - scripts/signal-cortex-reload.sh
+    # NO issue-nats-creds.sh step, deliberately: the escort is an IN-PROCESS
+    # agent (agent.yaml runtime.mode: in-process) — it rides the stack's single
+    # signing identity and is not bus-sovereign, so there is no per-agent NATS
+    # credential to mint. Compare example-agent/onboarding-tender, whose packs
+    # do mint one.
+    # Step 2 — scaffold the optional instance state (soft-skips if the
+    # agent-state bundle isn't installed; the escort runs stateless without it).
+    - scripts/scaffold-state.sh
